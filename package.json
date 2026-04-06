@@ -1,0 +1,34 @@
+{
+  "name": "sync-tablet",
+  "version": "1.0.0",
+  "description": "Sync Tablet — Phone Link para Linux",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "build": "vite build && electron-builder",
+    "preview": "vite preview"
+  },
+  "build": {
+    "appId": "com.synctablet.app",
+    "productName": "Sync Tablet",
+    "linux": {
+      "target": ["AppImage", "deb", "rpm"],
+      "category": "Utility"
+    },
+    "files": ["dist/**/*", "electron/**/*"],
+    "extraMetadata": { "main": "electron/main.js" }
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "lucide-react": "^0.400.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.1",
+    "concurrently": "^8.2.2",
+    "wait-on": "^7.2.0",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  }
+}
