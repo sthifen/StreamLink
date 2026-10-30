@@ -1224,8 +1224,11 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
 
     private void save() {
         main.removeCallbacks(saver);
+        if (dirty.isEmpty()) return;
         for (Ink.Page p : dirty) store.savePage(p);
         dirty.clear();
+        notebook.updated = System.currentTimeMillis();
+        store.saveNotebooks();
     }
 
     // ---- InkView.Listener ----

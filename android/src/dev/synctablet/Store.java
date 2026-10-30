@@ -117,6 +117,7 @@ final class Store {
 
     synchronized Ink.Notebook createNotebook(String title, int color) {
         Ink.Notebook n = new Ink.Notebook(Ink.newId(), title, color);
+        n.updated = System.currentTimeMillis();
         notebooks.add(0, n);
         addPage(n);
         return n;

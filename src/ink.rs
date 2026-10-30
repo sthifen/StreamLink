@@ -26,6 +26,9 @@ pub struct Notebook {
     pub folder: String,
     #[serde(default)]
     pub favorite: bool,
+    /// Última edición en la tablet (ms desde 1970).
+    #[serde(default)]
+    pub updated: u64,
 }
 
 fn default_cover() -> String {

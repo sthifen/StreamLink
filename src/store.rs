@@ -250,7 +250,7 @@ mod tests {
     }
 
     fn nb(title: &str, pages: &[&str]) -> Notebook {
-        Notebook { id: "nb1".into(), title: title.into(), color: "#000000".into(), pages: pages.iter().map(|s| s.to_string()).collect(), folder: String::new(), favorite: false }
+        Notebook { id: "nb1".into(), title: title.into(), color: "#000000".into(), pages: pages.iter().map(|s| s.to_string()).collect(), folder: String::new(), favorite: false, updated: 0 }
     }
 
     fn page(id: &str) -> Page {

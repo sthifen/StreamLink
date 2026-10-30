@@ -305,6 +305,8 @@ final class Ink {
         int color;
         String folder = "";
         boolean favorite;
+        /** Última vez que se escribió en él (ms), para «Recientes». */
+        long updated;
         final ArrayList<String> pages = new ArrayList<>();
 
         Notebook(String id, String title, int color) {
@@ -321,6 +323,7 @@ final class Ink {
             o.put("pages", new JSONArray(pages));
             o.put("folder", folder);
             o.put("favorite", favorite);
+            o.put("updated", updated);
             return o;
         }
 
@@ -331,6 +334,7 @@ final class Ink {
             if (p != null) for (int i = 0; i < p.length(); i++) n.pages.add(p.getString(i));
             n.folder = o.optString("folder", "");
             n.favorite = o.optBoolean("favorite");
+            n.updated = o.optLong("updated");
             return n;
         }
     }
