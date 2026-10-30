@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Tablet Control
+Exec=env SDL_VIDEO_X11_WMCLASS=TabletControl scrcpy --no-video --no-audio --mouse=uhid --keyboard=uhid
+Icon=/home/steven/Escritorio/beta2-redesign/logo.png
+Type=Application
+StartupWMClass=TabletControl
