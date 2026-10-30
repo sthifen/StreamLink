@@ -3,7 +3,6 @@ package dev.synctablet;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
-import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.Gravity;
@@ -17,10 +16,16 @@ import android.widget.TextView;
 
 import java.util.ArrayList;
 
-/** Portada: los cuadernos, el estado de la conexión con el PC y el WiFi. */
+/**
+ * Portada: los cuadernos como tarjetas de cristal sobre un fondo de
+ * auroras, el estado de la conexión con el PC y el WiFi.
+ */
 public final class MainActivity extends Activity implements SyncClient.Listener {
+    private AuroraView aurora;
     private LinearLayout grid;
     private TextView status;
+    private View statusDot;
+    private final ArrayList<GlassLayout> glass = new ArrayList<>();
     private SyncClient sync;
     private Store store;
 
@@ -29,44 +34,65 @@ public final class MainActivity extends Activity implements SyncClient.Listener 
         super.onCreate(saved);
         store = Store.get(this);
         sync = SyncClient.get(this);
-        int pad = Ui.dp(this, 24);
+        int pad = Ui.dp(this, 28);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Ui.BG);
-        Ui.fitSystemBars(root, pad, pad, pad, 0);
+        FrameLayout root = new FrameLayout(this);
+        aurora = new AuroraView(this);
+        root.addView(aurora, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setClipToPadding(false);
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(content);
+        root.addView(scroll, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        Ui.fitSystemBars(scroll, pad, pad, pad, pad);
+        // Al desplazar, lo que hay detrás de cada tarjeta cambia.
+        scroll.setOnScrollChangeListener((v, x, y, ox, oy) -> {
+            for (GlassLayout g : glass) g.invalidate();
+        });
 
         LinearLayout header = new LinearLayout(this);
         header.setGravity(Gravity.CENTER_VERTICAL);
-        header.addView(Ui.text(this, "Sync Tablet", 26, Ui.TEXT, true),
-                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        status = Ui.text(this, "", 14, Ui.MUTED, false);
-        status.setPadding(0, 0, Ui.dp(this, 12), 0);
-        header.addView(status);
-        TextView wifi = Ui.button(this, "WiFi");
+        LinearLayout titles = new LinearLayout(this);
+        titles.setOrientation(LinearLayout.VERTICAL);
+        titles.addView(Ui.text(this, "Sync Tablet", 32, 0xFFFFFFFF, true));
+        titles.addView(Ui.text(this, "Escribe con el lápiz; con el dedo mueves la hoja y haces zoom.", 15, 0xCCFFFFFF, false));
+        header.addView(titles, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+
+        GlassLayout pill = glass(Ui.dp(this, 22));
+        pill.setGravity(Gravity.CENTER_VERTICAL);
+        pill.setPadding(Ui.dp(this, 16), 0, Ui.dp(this, 6), 0);
+        statusDot = new View(this);
+        pill.addView(statusDot, new LinearLayout.LayoutParams(Ui.dp(this, 9), Ui.dp(this, 9)));
+        status = Ui.text(this, "", 14, 0xFFFFFFFF, false);
+        status.setPadding(Ui.dp(this, 8), 0, Ui.dp(this, 6), 0);
+        pill.addView(status);
+        IconView wifi = new IconView(this, IconView.WIFI, 0xFFFFFFFF, "Conectar por WiFi");
         wifi.setOnClickListener(v -> askWifi());
-        header.addView(wifi);
-        root.addView(header);
+        pill.addView(wifi);
+        header.addView(pill, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, Ui.dp(this, 48)));
+        content.addView(header);
 
-        TextView hint = Ui.text(this, "Escribe con el lápiz; con el dedo mueves la hoja y haces zoom. "
-                + "Con el PC conectado, lo que escribes aparece al momento en http://localhost:8788.", 14, Ui.MUTED, false);
-        hint.setPadding(0, Ui.dp(this, 8), 0, Ui.dp(this, 20));
-        root.addView(hint);
-
-        ScrollView scroll = new ScrollView(this);
         grid = new LinearLayout(this);
         grid.setOrientation(LinearLayout.VERTICAL);
-        grid.setPadding(0, 0, 0, pad);
-        scroll.addView(grid);
-        root.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        glp.topMargin = Ui.dp(this, 28);
+        content.addView(grid, glp);
         setContentView(root);
+    }
+
+    private GlassLayout glass(float radius) {
+        GlassLayout g = new GlassLayout(this, aurora, Ui.GLASS_DARK, radius);
+        glass.add(g);
+        return g;
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         sync.addListener(this);
-        root().post(this::fill);
+        grid.post(this::fill);
     }
 
     @Override
@@ -75,22 +101,19 @@ public final class MainActivity extends Activity implements SyncClient.Listener 
         sync.removeListener(this);
     }
 
-    private View root() {
-        return grid;
-    }
-
     @Override
     public void onStatus(boolean connected, String where) {
-        status.setText(connected ? "● Conectado al PC (" + where + ")" : "○ Sin conexión al PC");
-        status.setTextColor(connected ? Ui.ON : Ui.MUTED);
+        status.setText(connected ? "Conectado al PC · " + where : "Sin conexión al PC");
+        statusDot.setBackground(Ui.round(connected ? 0xFF34D399 : 0x80FFFFFF, Ui.dp(this, 5)));
     }
 
-    /** Rejilla de tapas: «Nuevo cuaderno» y un cuaderno por casilla. */
+    /** Rejilla: «Nuevo cuaderno» y un cuaderno por tarjeta. */
     private void fill() {
+        glass.retainAll(java.util.Collections.singleton(glass.get(0)));
         grid.removeAllViews();
         int width = grid.getWidth() > 0 ? grid.getWidth() : getResources().getDisplayMetrics().widthPixels;
-        int cols = Math.max(2, width / Ui.dp(this, 200));
-        int gap = Ui.dp(this, 16);
+        int cols = Math.max(2, width / Ui.dp(this, 220));
+        int gap = Ui.dp(this, 18);
         ArrayList<View> tiles = new ArrayList<>();
         tiles.add(newTile());
         for (Ink.Notebook n : store.notebooks()) tiles.add(tile(n));
@@ -98,51 +121,61 @@ public final class MainActivity extends Activity implements SyncClient.Listener 
         for (int i = 0; i < tiles.size(); i++) {
             if (i % cols == 0) {
                 row = new LinearLayout(this);
-                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 230));
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 250));
                 lp.bottomMargin = gap;
                 grid.addView(row, lp);
             }
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1);
-            if (i % cols != cols - 1) lp.rightMargin = gap;
-            row.addView(tiles.get(i), lp);
+            row.addView(tiles.get(i), cellParams(i % cols, cols, gap));
         }
-        // Huecos al final de la última fila, para que las casillas no se estiren.
-        for (int i = tiles.size() % cols; i != 0 && i < cols; i++) {
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1);
-            if (i != cols - 1) lp.rightMargin = gap;
-            row.addView(new View(this), lp);
-        }
+        // Huecos al final de la última fila, para que las tarjetas no se estiren.
+        for (int i = tiles.size() % cols; i != 0 && i < cols; i++) row.addView(new View(this), cellParams(i, cols, gap));
+    }
+
+    private LinearLayout.LayoutParams cellParams(int col, int cols, int gap) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1);
+        if (col != cols - 1) lp.rightMargin = gap;
+        return lp;
     }
 
     private View newTile() {
-        TextView t = Ui.text(this, "+\nNuevo cuaderno", 17, Ui.TEXT, true);
-        t.setGravity(Gravity.CENTER);
-        GradientDrawable d = Ui.round(0x00000000, Ui.dp(this, 18));
-        d.setStroke(Ui.dp(this, 2), 0x55FFFFFF, Ui.dp(this, 8), Ui.dp(this, 6));
-        t.setBackground(d);
-        t.setOnClickListener(v -> askNew());
-        return t;
+        GlassLayout g = glass(Ui.dp(this, 26));
+        g.setOrientation(LinearLayout.VERTICAL);
+        g.setGravity(Gravity.CENTER);
+        IconView plus = new IconView(this, IconView.PLUS, 0xFFFFFFFF, "Nuevo cuaderno");
+        plus.setClickable(false);
+        LinearLayout.LayoutParams center = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        center.gravity = Gravity.CENTER_HORIZONTAL;
+        g.addView(plus, center);
+        g.addView(Ui.text(this, "Nuevo cuaderno", 17, 0xFFFFFFFF, true), center);
+        g.setOnClickListener(v -> askNew());
+        g.setContentDescription("Nuevo cuaderno");
+        return g;
     }
 
+    /** Tarjeta de cristal con el lomo del color del cuaderno. */
     private View tile(Ink.Notebook n) {
-        FrameLayout f = new FrameLayout(this);
-        f.setBackground(Ui.round(n.color, Ui.dp(this, 18)));
-        int pad = Ui.dp(this, 16);
-        f.setPadding(pad, pad, pad, pad);
+        GlassLayout g = glass(Ui.dp(this, 26));
+        int pad = Ui.dp(this, 18);
+        g.setPadding(pad, pad, pad, pad);
+        View spine = new View(this);
+        spine.setBackground(Ui.round(n.color, Ui.dp(this, 6)));
+        spine.setElevation(Ui.dp(this, 2));
+        g.addView(spine, new LinearLayout.LayoutParams(Ui.dp(this, 12), ViewGroup.LayoutParams.MATCH_PARENT));
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setGravity(Gravity.BOTTOM);
-        col.addView(Ui.text(this, n.title, 19, 0xFFFFFFFF, true));
+        col.setPadding(Ui.dp(this, 16), 0, 0, 0);
+        col.addView(Ui.text(this, n.title, 20, 0xFFFFFFFF, true));
         col.addView(Ui.text(this, n.pages.size() == 1 ? "1 página" : n.pages.size() + " páginas", 14, 0xCCFFFFFF, false));
-        f.addView(col, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        f.setClickable(true);
-        f.setOnClickListener(v -> open(n));
-        f.setOnLongClickListener(v -> {
+        g.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1));
+        g.setClickable(true);
+        g.setOnClickListener(v -> open(n));
+        g.setOnLongClickListener(v -> {
             menu(n);
             return true;
         });
-        f.setContentDescription("Cuaderno " + n.title);
-        return f;
+        g.setContentDescription("Cuaderno " + n.title);
+        return g;
     }
 
     private void open(Ink.Notebook n) {

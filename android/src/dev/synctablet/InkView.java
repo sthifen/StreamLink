@@ -6,6 +6,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
@@ -47,6 +48,12 @@ final class InkView extends View {
     int highlighterColor = 0xFFFFD60A;
     float highlighterWidth = 24f;
     boolean fingerDraws;
+    /** Convertir cada trazo en figura si lo parece (sin tener que esperar). */
+    boolean autoShapes;
+    /** Alto de la barra flotante: la hoja empieza debajo. */
+    float topInset;
+    /** Tras cada fotograma (para que el cristal de encima se actualice). */
+    Runnable onFrame;
 
     private Ink.Page page;
     private Listener listener;
@@ -68,6 +75,11 @@ final class InkView extends View {
     private boolean erasing;
     private final ArrayList<Ink.Stroke> erased = new ArrayList<>();
     private final Path highlighterPath = new Path();
+    // Mantener el lápiz quieto al final de un trazo lo convierte en figura.
+    private static final long HOLD_MS = 550;
+    private final Runnable holdCheck = this::snapIfHeld;
+    private boolean snapped;
+    private float holdX, holdY;
 
     private final ArrayDeque<Object[]> undo = new ArrayDeque<>(), redo = new ArrayDeque<>();
 
@@ -139,7 +151,7 @@ final class InkView extends View {
         if (!fitted) {
             scale = fitScale;
             ox = (w - Ink.W * scale) / 2;
-            oy = margin;
+            oy = topInset + margin;
             fitted = true;
         }
         clampView();
@@ -257,6 +269,8 @@ final class InkView extends View {
             ink.setAlpha(255);
             c.restore();
         }
+        // Sólo el dibujo de verdad, no las copias que hace el cristal.
+        if (onFrame != null && c.isHardwareAccelerated()) onFrame.run();
     }
 
     // ---- Entrada ----
@@ -367,6 +381,8 @@ final class InkView extends View {
         current = new Ink.Stroke(Ink.newId(), hl ? Ink.HIGHLIGHTER : Ink.PEN,
                 hl ? highlighterColor : penColor, hl ? highlighterWidth : penWidth);
         highlighterPath.reset();
+        snapped = false;
+        holdX = holdY = Float.NaN;
     }
 
     private void addPoint(MotionEvent e, int idx, int h) {
@@ -379,7 +395,14 @@ final class InkView extends View {
             return;
         }
         Ink.Stroke s = current;
-        if (s == null) return;
+        if (s == null || snapped) return;
+        // Se movió: vuelve a contar el tiempo quieto.
+        if (Float.isNaN(holdX) || Math.hypot(x - holdX, y - holdY) > 4) {
+            holdX = x;
+            holdY = y;
+            removeCallbacks(holdCheck);
+            postDelayed(holdCheck, HOLD_MS);
+        }
         if (s.n > 0) {
             float dx = x - s.x(s.n - 1), dy = y - s.y(s.n - 1);
             if (dx * dx + dy * dy < 0.25f) return;
@@ -398,6 +421,52 @@ final class InkView extends View {
         }
     }
 
+    /** El lápiz lleva quieto un rato sin levantarse: ¿era una figura? */
+    private void snapIfHeld() {
+        if (current == null || pointerId == -1 || snapped || erasing) return;
+        if (toShape(current)) {
+            snapped = true;
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            redrawCurrent();
+        }
+    }
+
+    /** Sustituye el trazo por su figura perfecta, si la reconoce. */
+    private boolean toShape(Ink.Stroke s) {
+        if (s.n < 3) return false;
+        float[] xy = new float[2 * s.n];
+        float pressure = 0;
+        for (int i = 0; i < s.n; i++) {
+            xy[2 * i] = s.x(i);
+            xy[2 * i + 1] = s.y(i);
+            pressure += s.p(i);
+        }
+        ShapeRecognizer.Shape shape = ShapeRecognizer.recognize(xy, s.n);
+        if (shape == null) return false;
+        s.replace(shape.xy, Math.max(0.5f, pressure / s.n));
+        return true;
+    }
+
+    /** Tras cambiar el trazo en curso: quitar lo pintado y pintarlo de nuevo. */
+    private void redrawCurrent() {
+        renderLayer();
+        Ink.Stroke s = current;
+        if (s == null) return;
+        if (Ink.HIGHLIGHTER.equals(s.tool)) {
+            highlighterPath.reset();
+            for (int i = 0; i < s.n; i++) {
+                if (i == 0) highlighterPath.moveTo(s.x(i), s.y(i));
+                else highlighterPath.lineTo(s.x(i), s.y(i));
+            }
+        } else {
+            layerCanvas.save();
+            toPage(layerCanvas, scale, ox, oy);
+            drawStroke(layerCanvas, s);
+            layerCanvas.restore();
+        }
+        invalidate();
+    }
+
     private void eraseAt(float x, float y) {
         float r = 10;
         boolean any = false;
@@ -414,6 +483,7 @@ final class InkView extends View {
 
     private void finish() {
         pointerId = -1;
+        removeCallbacks(holdCheck);
         if (erasing) {
             erasing = false;
             if (erased.isEmpty()) return;
@@ -424,6 +494,7 @@ final class InkView extends View {
             redo.clear();
         } else {
             Ink.Stroke s = current;
+            if (s != null && !snapped && autoShapes && toShape(s)) redrawCurrent();
             current = null;
             if (s == null || s.n == 0) return;
             page.strokes.add(s);

@@ -17,6 +17,13 @@ final class Ui {
     static final int ACCENT = 0xFF2DD4BF;
     static final int ACCENT_TEXT = 0xFF062A26;
     static final int ON = 0xFF34D399;
+    /** Sobre el cristal claro de la hoja. */
+    static final int GLASS_LIGHT = 0x9EFFFFFF;
+    static final int GLASS_DARK = 0x24FFFFFF;
+    static final int ICON = 0xFF1F2937;
+    static final int ICON_MUTED = 0xFF4B5563;
+    /** Herramienta activa: grafito, el icono en blanco. */
+    static final int ACCENT_DEEP = 0xFF1F2937;
 
     static final int[] COVERS = {0xFF0F766E, 0xFF2563EB, 0xFF7C3AED, 0xFFDB2777, 0xFFEA580C, 0xFFCA8A04, 0xFF16A34A, 0xFF475569};
 
@@ -51,6 +58,10 @@ final class Ui {
                     right + in.getSystemWindowInsetRight(), bottom + in.getSystemWindowInsetBottom());
             return in.consumeSystemWindowInsets();
         });
+    }
+
+    static void toast(Context c, String s) {
+        android.widget.Toast.makeText(c, s, android.widget.Toast.LENGTH_SHORT).show();
     }
 
     /** Botón de la barra: 44 dp de alto como mínimo, resaltado si está activo. */

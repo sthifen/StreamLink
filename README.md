@@ -18,6 +18,9 @@
   El **lápiz escribe** (con presión) y **el dedo mueve la hoja y hace zoom**, así la
   palma no pinta. Pluma, resaltador, goma (también con la punta de goma o el botón
   del S Pen), deshacer y rehacer. Funciona sin el PC.
+- **Figuras perfectas:** al terminar un trazo, deja el lápiz quieto medio segundo y se
+  convierte en línea, círculo, elipse, rectángulo o triángulo. Con el botón de figuras
+  activado se convierte cualquier trazo que lo parezca.
 - **En el PC:** lo que escribes aparece al momento en `http://localhost:8788`, y cada
   página se guarda en `~/SyncTablet/<Cuaderno>/Página NN.svg` para abrirla en
   cualquier programa (Obsidian, el navegador, un visor de imágenes).
@@ -38,6 +41,7 @@
 cargo build --release          # PC: target/release/synctablet
 android/build-apk.sh --install # tablet: sin Gradle ni Android Studio
 cargo test
+tests/shapes.sh                # reconocedor de figuras, 60 rondas
 ```
 
 ## Cómo funciona

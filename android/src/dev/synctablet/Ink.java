@@ -71,6 +71,14 @@ final class Ink {
             maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
         }
 
+        /** Cambia los puntos por otros (una figura perfecta), con presión fija. */
+        void replace(float[] xy, float p) {
+            n = 0;
+            minX = minY = Float.MAX_VALUE;
+            maxX = maxY = -Float.MAX_VALUE;
+            for (int i = 0; i + 1 < xy.length; i += 2) add(xy[i], xy[i + 1], p);
+        }
+
         float x(int i) { return pts[3 * i]; }
         float y(int i) { return pts[3 * i + 1]; }
         float p(int i) { return pts[3 * i + 2]; }
