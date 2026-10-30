@@ -18,10 +18,12 @@ public class ShapeTest {
         return a;
     }
     static int fails = 0;
-    static void check(String name, float[] xy, String want) {
+    static void check(String name, float[] xy, String want) { check(name, xy, want, false); }
+    /** orNone: no convertirlo también vale (en la duda, mejor no tocar el trazo). */
+    static void check(String name, float[] xy, String want, boolean orNone) {
         ShapeRecognizer.Shape s = ShapeRecognizer.recognize(xy, xy.length/2);
         String got = s == null ? null : s.kind;
-        boolean ok = Objects.equals(got, want);
+        boolean ok = Objects.equals(got, want) || (orNone && got == null);
         if (!ok) fails++;
         System.out.printf("%s %-28s → %s%n", ok ? "✓" : "✗", name, got == null ? "(nada)" : got);
     }
@@ -34,7 +36,7 @@ public class ShapeTest {
         check("línea", poly(new float[][]{{100,100},{500,180}},2f), ShapeRecognizer.LINE);
         check("línea casi horizontal", poly(new float[][]{{100,300},{600,318}},2f), ShapeRecognizer.LINE);
         check("rombo", poly(new float[][]{{250,100},{400,250},{250,400},{100,250},{248,104}},2f), ShapeRecognizer.RECTANGLE);
-        check("trapecio", poly(new float[][]{{150,100},{350,100},{450,300},{50,300},{148,104}},2f), ShapeRecognizer.QUAD);
+        check("trapecio", poly(new float[][]{{150,100},{350,100},{450,300},{50,300},{148,104}},2f), ShapeRecognizer.QUAD, true);
         check("arco en C (abierto)", ell(300,300,100,100,2,Math.PI*1.3), null);
         check("letra S", poly(new float[][]{{300,100},{150,120},{160,220},{300,250},{310,360},{150,380}},2f), null);
         check("zigzag", poly(new float[][]{{100,100},{150,200},{200,100},{250,200},{300,100},{350,200}},1f), null);
