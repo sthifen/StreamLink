@@ -1,29 +1,40 @@
 package dev.synctablet;
 
+import android.animation.ValueAnimator;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.RectF;
 import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
+import android.view.VelocityTracker;
 import android.view.View;
+import android.view.animation.DecelerateInterpolator;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
- * La hoja: el lápiz dibuja, los dedos mueven y hacen zoom.
+ * El cuaderno: todas sus páginas una debajo de otra. El lápiz dibuja; los
+ * dedos desplazan (con inercia) y hacen zoom. Al final del cuaderno, seguir
+ * tirando hacia arriba crea una página nueva.
  *
  * Rechazo de la palma: mientras el lápiz toca, los dedos se ignoran, y los
  * dedos sólo dibujan si se activa «Dibujar con el dedo» (tablets sin lápiz).
  * La punta de goma o el botón del lápiz borran.
  *
  * Para que el trazo vaya pegado al lápiz:
- * - lo ya dibujado vive en un bitmap (`layer`) y sólo se rehace al cambiar
- *   el zoom o al borrar; durante un gesto se estira ese bitmap;
+ * - lo ya dibujado vive en un bitmap (`layer`) que cubre la pantalla y media
+ *   pantalla más por arriba y por abajo; al desplazar se mueve ese bitmap y
+ *   sólo se rehace al salirse de ese margen, al hacer zoom o al borrar;
  * - cada tramo nuevo de pluma se pinta directamente en el bitmap;
  * - se usan los puntos intermedios de cada MotionEvent y
  *   `requestUnbufferedDispatch` para recibirlos sin esperar al vsync.
@@ -34,13 +45,20 @@ final class InkView extends View {
     interface Listener {
         /** Una operación para el PC (trazo, borrado o página entera). */
         void onOp(String json);
-        /** La página cambió: hay que guardarla. */
-        void onEdited();
+        /** Esa página cambió: hay que guardarla. */
+        void onEdited(Ink.Page page);
         void onUndoState(boolean canUndo, boolean canRedo);
+        /** La página que más se ve ahora. */
+        void onPageVisible(int index);
+        /** Se tiró hacia arriba al final del cuaderno: crear una página. */
+        void onPullAddPage();
     }
 
     private static final int DESK = 0xFFDDE2E8;
     private static final float MARGIN_DP = 24;
+    /** Separación entre páginas, en unidades de página. */
+    private static final float GAP = 36;
+    private static final float PULL_DP = 110, PULL_MAX_DP = 260;
 
     int tool = PEN;
     int penColor = 0xFF111827;
@@ -50,30 +68,43 @@ final class InkView extends View {
     boolean fingerDraws;
     /** Convertir cada trazo en figura si lo parece (sin tener que esperar). */
     boolean autoShapes;
-    /** Alto de la barra flotante: la hoja empieza debajo. */
+    /** Alto de la barra flotante: la primera página empieza debajo. */
     float topInset;
     /** Tras cada fotograma (para que el cristal de encima se actualice). */
     Runnable onFrame;
 
-    private Ink.Page page;
+    private final ArrayList<Ink.Page> pages = new ArrayList<>();
     private Listener listener;
+    private int visible = -1;
 
-    // Pantalla = página · scale + (ox, oy).
+    // Pantalla = documento · scale + (ox, oy). El documento son las páginas
+    // apiladas: la página i empieza en y = i · (H + GAP).
     private float scale = 1, ox, oy, fitScale = 1;
     private boolean fitted;
+    private int pendingScroll = -1;
 
     private Bitmap layer;
     private Canvas layerCanvas;
     private float layerScale, layerOx, layerOy;
+    private int pad;
 
     private final ScaleGestureDetector scaler;
+    private VelocityTracker velocity;
+    private ValueAnimator scroller;
     private float focusX = Float.NaN, focusY = Float.NaN;
     private int fingers;
+    private boolean pulled;
+    /** El gesto empezó ya al final: sólo entonces se puede tirar por una página nueva. */
+    private boolean atEnd;
+    /** Cuándo pasó del umbral (un tirón rápido de paso no crea páginas). */
+    private long readySince;
+    private static final long PULL_HOLD_MS = 220;
 
     private Ink.Stroke current;
+    private int currentPage;
     private int pointerId = -1;
     private boolean erasing;
-    private final ArrayList<Ink.Stroke> erased = new ArrayList<>();
+    private final LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>> erased = new LinkedHashMap<>();
     private final Path highlighterPath = new Path();
     // Mantener el lápiz quieto al final de un trazo lo convierte en figura.
     private static final long HOLD_MS = 550;
@@ -81,12 +112,15 @@ final class InkView extends View {
     private boolean snapped;
     private float holdX, holdY;
 
+    /** Cada acción: {"add" | "erase", página → trazos}. */
     private final ArrayDeque<Object[]> undo = new ArrayDeque<>(), redo = new ArrayDeque<>();
 
     private final Paint ink = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint lines = new Paint();
     private final Paint sheet = new Paint();
     private final Paint shade = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint dashed = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint label = new Paint(Paint.ANTI_ALIAS_FLAG);
 
     InkView(Context c) {
         super(c);
@@ -96,11 +130,19 @@ final class InkView extends View {
         lines.setColor(0xFFC9D3E3);
         lines.setStrokeWidth(1);
         sheet.setColor(Color.WHITE);
-        shade.setColor(0x33000000);
+        shade.setColor(0x26000000);
+        float d = c.getResources().getDisplayMetrics().density;
+        dashed.setStyle(Paint.Style.STROKE);
+        dashed.setStrokeWidth(2 * d);
+        dashed.setColor(0xFF9CA3AF);
+        dashed.setPathEffect(new DashPathEffect(new float[] {10 * d, 8 * d}, 0));
+        label.setColor(0xFF4B5563);
+        label.setTextSize(16 * c.getResources().getDisplayMetrics().scaledDensity);
+        label.setTextAlign(Paint.Align.CENTER);
         scaler = new ScaleGestureDetector(c, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override
-            public boolean onScale(ScaleGestureDetector d) {
-                zoomAround(d.getFocusX(), d.getFocusY(), d.getScaleFactor());
+            public boolean onScale(ScaleGestureDetector det) {
+                zoomAround(det.getFocusX(), det.getFocusY(), det.getScaleFactor());
                 return true;
             }
         });
@@ -111,53 +153,106 @@ final class InkView extends View {
         listener = l;
     }
 
-    void setPage(Ink.Page p) {
-        page = p;
+    /** Las páginas del cuaderno, empezando por la `show`. */
+    void setPages(List<Ink.Page> list, int show) {
+        pages.clear();
+        pages.addAll(list);
         current = null;
         pointerId = -1;
         erasing = false;
         undo.clear();
         redo.clear();
+        visible = -1;
+        pendingScroll = show;
         fitted = false;
         layout();
         notifyUndo();
     }
 
-    Ink.Page page() {
-        return page;
+    /** Página nueva al final, y desplazarse hasta ella. */
+    void appendPage(Ink.Page p) {
+        pages.add(p);
+        scrollToPage(pages.size() - 1, true);
+    }
+
+    /** Quita la página i de la vista (ya borrada del cuaderno). */
+    void removePage(int i) {
+        if (i < 0 || i >= pages.size()) return;
+        Ink.Page gone = pages.remove(i);
+        // Sus acciones ya no se pueden deshacer.
+        undo.removeIf(a -> ((Map<?, ?>) a[1]).containsKey(gone));
+        redo.removeIf(a -> ((Map<?, ?>) a[1]).containsKey(gone));
+        notifyUndo();
+        visible = -1;
+        clampView(false);
+        renderLayer();
+    }
+
+    int pageCount() {
+        return pages.size();
+    }
+
+    Ink.Page visiblePage() {
+        return visible >= 0 && visible < pages.size() ? pages.get(visible) : null;
     }
 
     void setBackground(String bg) {
+        Ink.Page page = visiblePage();
         if (page == null || bg.equals(page.background)) return;
         page.background = bg;
         page.version++;
         listener.onOp("{\"t\":\"page\",\"page\":" + page.toJson() + "}");
-        listener.onEdited();
+        listener.onEdited(page);
         renderLayer();
     }
 
     // ---- Vista: encajar, zoom y desplazamiento ----
 
+    private static float pageTop(int i) {
+        return i * (Ink.H + GAP);
+    }
+
+    private float docHeight() {
+        return pages.isEmpty() ? Ink.H : pageTop(pages.size()) - GAP;
+    }
+
+    /** La página en la altura y del documento (la más cercana). */
+    private int pageAt(float docY) {
+        int i = (int) Math.floor((docY + GAP / 2) / (Ink.H + GAP));
+        return Math.max(0, Math.min(pages.size() - 1, i));
+    }
+
+    private float margin() {
+        return MARGIN_DP * getResources().getDisplayMetrics().density;
+    }
+
     @Override
     protected void onSizeChanged(int w, int h, int ow, int oh) {
+        // Al girar la tablet: volver a encajar, en la misma página.
+        if (fitted && visible >= 0) pendingScroll = visible;
+        fitted = false;
         layout();
     }
 
     private void layout() {
         int w = getWidth(), h = getHeight();
         if (w == 0 || h == 0) return;
-        float margin = MARGIN_DP * getResources().getDisplayMetrics().density;
-        fitScale = (w - 2 * margin) / Ink.W;
+        fitScale = (w - 2 * margin()) / Ink.W;
         if (!fitted) {
             scale = fitScale;
             ox = (w - Ink.W * scale) / 2;
-            oy = topInset + margin;
+            oy = topInset + margin();
             fitted = true;
         }
-        clampView();
-        if (layer == null || layer.getWidth() != w || layer.getHeight() != h) {
+        if (pendingScroll >= 0) {
+            oy = topInset + margin() - pageTop(pendingScroll) * scale;
+            pendingScroll = -1;
+        }
+        clampView(false);
+        pad = h / 2;
+        if (layer == null || layer.getWidth() != w || layer.getHeight() != h + 2 * pad) {
             if (layer != null) layer.recycle();
-            layer = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            layer = Bitmap.createBitmap(w, h + 2 * pad, Bitmap.Config.ARGB_8888);
             layerCanvas = new Canvas(layer);
         }
         renderLayer();
@@ -168,24 +263,91 @@ final class InkView extends View {
         ox = fx - (fx - ox) * s / scale;
         oy = fy - (fy - oy) * s / scale;
         scale = s;
-        clampView();
+        clampView(false);
         invalidate();
     }
 
-    /** Que la hoja nunca se vaya del todo de la pantalla. */
-    private void clampView() {
-        float w = getWidth(), h = getHeight(), pw = Ink.W * scale, ph = Ink.H * scale, keep = 120;
-        ox = Math.max(keep - pw, Math.min(w - keep, ox));
-        oy = Math.max(keep - ph, Math.min(h - keep, oy));
+    /** Límite de arriba y de abajo de oy (sin contar el tirón del final). */
+    private float minOy() {
+        float h = getHeight();
+        return Math.min(topInset + margin(), h - margin() - docHeight() * scale);
     }
 
-    /** Página → pantalla en el canvas dado. */
-    private void toPage(Canvas c, float s, float x, float y) {
-        c.translate(x, y);
-        c.scale(s, s);
+    private float maxOy() {
+        return topInset + margin();
+    }
+
+    /** Cuánto se ha tirado más allá del final del cuaderno, en px. */
+    private float overscroll() {
+        return Math.max(0, minOy() - oy);
+    }
+
+    /** Dentro de límites; con `pulling`, deja tirar más allá del final. */
+    private void clampView(boolean pulling) {
+        float w = getWidth(), pw = Ink.W * scale, m = margin();
+        if (pw <= w - 2 * m) ox = (w - pw) / 2;
+        else ox = Math.max(w - m - pw, Math.min(m, ox));
+        float pullMax = pulling ? PULL_MAX_DP * getResources().getDisplayMetrics().density : 0;
+        oy = Math.max(minOy() - pullMax, Math.min(maxOy(), oy));
+        notifyVisible();
+    }
+
+    private void notifyVisible() {
+        if (pages.isEmpty() || getHeight() == 0) return;
+        int v = pageAt((getHeight() / 2f - oy) / scale);
+        if (v != visible) {
+            visible = v;
+            if (listener != null) listener.onPageVisible(v);
+        }
+    }
+
+    void scrollToPage(int i, boolean animate) {
+        if (i < 0 || i >= pages.size()) return;
+        float target = topInset + margin() - pageTop(i) * scale;
+        float save = oy;
+        oy = target;
+        clampView(false);
+        target = oy;
+        oy = save;
+        if (animate) animateOy(target, 380);
+        else {
+            oy = target;
+            afterScroll();
+        }
+    }
+
+    private void animateOy(float target, long ms) {
+        if (scroller != null) scroller.cancel();
+        scroller = ValueAnimator.ofFloat(oy, target);
+        scroller.setDuration(ms);
+        scroller.setInterpolator(new DecelerateInterpolator(1.6f));
+        scroller.addUpdateListener(a -> {
+            oy = (float) a.getAnimatedValue();
+            notifyVisible();
+            afterScroll();
+        });
+        scroller.start();
+    }
+
+    /** Tras desplazar: si el bitmap ya no cubre lo que se ve, rehacerlo. */
+    private void afterScroll() {
+        if (layerScale != scale || Math.abs(ox - layerOx) > 1 || Math.abs(oy - layerOy) > pad * 0.7f) renderLayer();
+        else invalidate();
+    }
+
+    private boolean layerAligned() {
+        return layerScale == scale && layerOx == ox && layerOy == oy;
     }
 
     // ---- Dibujo ----
+
+    /** Prepara el canvas del bitmap para dibujar en la página i. */
+    private void onLayerPage(int i) {
+        layerCanvas.save();
+        layerCanvas.translate(layerOx, layerOy + pad);
+        layerCanvas.scale(layerScale, layerScale);
+        layerCanvas.translate(0, pageTop(i));
+    }
 
     /** Rehace el bitmap con todo lo dibujado, con la vista actual. */
     private void renderLayer() {
@@ -195,25 +357,26 @@ final class InkView extends View {
         layerScale = scale;
         layerOx = ox;
         layerOy = oy;
-        if (page == null) {
-            invalidate();
-            return;
+        float top = (-pad - oy) / scale, bottom = (getHeight() + pad - oy) / scale;
+        for (int i = 0; i < pages.size(); i++) {
+            float y = pageTop(i);
+            if (y > bottom || y + Ink.H < top) continue;
+            Ink.Page p = pages.get(i);
+            onLayerPage(i);
+            c.drawRect(3, 5, Ink.W + 3, Ink.H + 5, shade);
+            c.drawRect(0, 0, Ink.W, Ink.H, sheet);
+            drawBackground(c, p);
+            for (Ink.Stroke s : p.strokes) drawStroke(c, s);
+            c.restore();
         }
-        c.save();
-        toPage(c, scale, ox, oy);
-        c.drawRect(4, 6, Ink.W + 4, Ink.H + 6, shade);
-        c.drawRect(0, 0, Ink.W, Ink.H, sheet);
-        drawBackground(c);
-        for (Ink.Stroke s : page.strokes) drawStroke(c, s);
-        c.restore();
         invalidate();
     }
 
-    private void drawBackground(Canvas c) {
-        if (Ink.PLAIN.equals(page.background)) return;
+    private void drawBackground(Canvas c, Ink.Page p) {
+        if (Ink.PLAIN.equals(p.background)) return;
         lines.setStrokeWidth(1 / Math.max(scale, 0.01f));
         for (float y = 80; y < Ink.H; y += 40) c.drawLine(0, y, Ink.W, y, lines);
-        if (Ink.GRID.equals(page.background)) for (float x = 40; x < Ink.W; x += 40) c.drawLine(x, 0, x, Ink.H, lines);
+        if (Ink.GRID.equals(p.background)) for (float x = 40; x < Ink.W; x += 40) c.drawLine(x, 0, x, Ink.H, lines);
     }
 
     private void drawStroke(Canvas c, Ink.Stroke s) {
@@ -247,21 +410,23 @@ final class InkView extends View {
     @Override
     protected void onDraw(Canvas c) {
         if (layer == null) return;
-        if (layerScale == scale && layerOx == ox && layerOy == oy) {
-            c.drawBitmap(layer, 0, 0, null);
+        if (layerScale == scale) {
+            c.drawBitmap(layer, ox - layerOx, oy - layerOy - pad, null);
         } else {
-            // En pleno gesto: estirar lo que había; se rehace al soltar.
+            // En pleno zoom: estirar lo que había; se rehace al soltar.
             c.drawColor(DESK);
             float k = scale / layerScale;
             c.save();
-            c.translate(ox - layerOx * k, oy - layerOy * k);
+            c.translate(ox - layerOx * k, oy - (layerOy + pad) * k);
             c.scale(k, k);
             c.drawBitmap(layer, 0, 0, null);
             c.restore();
         }
         if (current != null && Ink.HIGHLIGHTER.equals(current.tool) && current.n > 0) {
             c.save();
-            toPage(c, scale, ox, oy);
+            c.translate(ox, oy);
+            c.scale(scale, scale);
+            c.translate(0, pageTop(currentPage));
             ink.setColor(current.color);
             ink.setAlpha(90);
             ink.setStrokeWidth(current.width);
@@ -269,8 +434,25 @@ final class InkView extends View {
             ink.setAlpha(255);
             c.restore();
         }
+        drawPull(c);
         // Sólo el dibujo de verdad, no las copias que hace el cristal.
         if (onFrame != null && c.isHardwareAccelerated()) onFrame.run();
+    }
+
+    /** Debajo de la última página: la página nueva que aparece al tirar. */
+    private void drawPull(Canvas c) {
+        float over = overscroll();
+        if (over <= 0 || pages.isEmpty()) return;
+        float top = oy + (pageTop(pages.size()) ) * scale;
+        float left = ox, right = ox + Ink.W * scale, bottom = Math.min(getHeight() - margin() / 2, top + Ink.H * scale);
+        if (bottom <= top + 8) return;
+        float r = 6 * getResources().getDisplayMetrics().density;
+        c.drawRoundRect(new RectF(left, top, right, bottom), r, r, dashed);
+        boolean ready = over >= PULL_DP * getResources().getDisplayMetrics().density;
+        float cy = (top + bottom) / 2;
+        label.setFakeBoldText(ready);
+        c.drawText(ready ? "Suelta para una página nueva" : "Tira para una página nueva", (left + right) / 2,
+                cy + label.getTextSize() / 3, label);
     }
 
     // ---- Entrada ----
@@ -295,7 +477,7 @@ final class InkView extends View {
 
     @Override
     public boolean onTouchEvent(MotionEvent e) {
-        if (page == null) return false;
+        if (pages.isEmpty()) return false;
         int action = e.getActionMasked();
         int idx = e.getActionIndex();
         switch (action) {
@@ -303,10 +485,12 @@ final class InkView extends View {
             case MotionEvent.ACTION_POINTER_DOWN:
                 if (pointerId == -1 && draws(e, idx)) {
                     requestUnbufferedDispatch(e);
+                    if (scroller != null) scroller.cancel();
+                    if (!layerAligned()) renderLayer();
                     pointerId = e.getPointerId(idx);
                     erasing = erases(e, idx);
                     if (erasing) erased.clear();
-                    else startStroke();
+                    else startStroke(pageAt((e.getY(idx) - oy) / scale));
                     addPoint(e, idx, -1);
                     return true;
                 }
@@ -343,10 +527,18 @@ final class InkView extends View {
         return gesture(e);
     }
 
-    /** Dedos: uno mueve, dos mueven y hacen zoom. */
+    /** Dedos: uno desplaza (con inercia), dos desplazan y hacen zoom. */
     private boolean gesture(MotionEvent e) {
         scaler.onTouchEvent(e);
         int action = e.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) {
+            if (scroller != null) scroller.cancel();
+            if (velocity != null) velocity.recycle();
+            velocity = VelocityTracker.obtain();
+            pulled = false;
+            atEnd = oy <= minOy() + 2;
+        }
+        if (velocity != null) velocity.addMovement(e);
         int skip = action == MotionEvent.ACTION_POINTER_UP || action == MotionEvent.ACTION_UP ? e.getActionIndex() : -1;
         float sx = 0, sy = 0;
         int n = 0;
@@ -361,22 +553,61 @@ final class InkView extends View {
             fingers = n;
         }
         if (n == 0) {
-            if (layerScale != scale || layerOx != ox || layerOy != oy) renderLayer();
+            release();
             return true;
         }
         float fx = sx / n, fy = sy / n;
         if (!Float.isNaN(focusX) && action == MotionEvent.ACTION_MOVE) {
+            float dy = fy - focusY;
+            // Más allá del final cuesta más tirar (como una goma).
+            if (dy < 0 && overscroll() > 0) dy *= 0.45f;
             ox += fx - focusX;
-            oy += fy - focusY;
-            clampView();
-            invalidate();
+            oy += dy;
+            clampView(atEnd);
+            boolean ready = overscroll() >= PULL_DP * getResources().getDisplayMetrics().density;
+            if (ready && !pulled) {
+                performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
+                readySince = android.os.SystemClock.uptimeMillis();
+            }
+            pulled = ready;
+            if (layerScale == scale) afterScroll();
+            else invalidate();
         }
         focusX = fx;
         focusY = fy;
         return true;
     }
 
-    private void startStroke() {
+    /** Dedos fuera: página nueva si se tiró bastante; si no, inercia o volver al sitio. */
+    private void release() {
+        float over = overscroll();
+        boolean held = pulled && android.os.SystemClock.uptimeMillis() - readySince >= PULL_HOLD_MS;
+        pulled = false;
+        if (held && over >= PULL_DP * getResources().getDisplayMetrics().density) {
+            listener.onPullAddPage();
+            return;
+        }
+        if (over > 0) {
+            animateOy(minOy(), 260);
+            return;
+        }
+        float vy = 0;
+        if (velocity != null) {
+            velocity.computeCurrentVelocity(1000);
+            vy = velocity.getYVelocity();
+            velocity.recycle();
+            velocity = null;
+        }
+        if (Math.abs(vy) > 600 && layerScale == scale) {
+            float target = Math.max(minOy(), Math.min(maxOy(), oy + vy * 0.35f));
+            animateOy(target, 520);
+        } else if (!layerAligned()) {
+            renderLayer();
+        }
+    }
+
+    private void startStroke(int page) {
+        currentPage = page;
         boolean hl = tool == HIGHLIGHTER;
         current = new Ink.Stroke(Ink.newId(), hl ? Ink.HIGHLIGHTER : Ink.PEN,
                 hl ? highlighterColor : penColor, hl ? highlighterWidth : penWidth);
@@ -388,14 +619,16 @@ final class InkView extends View {
     private void addPoint(MotionEvent e, int idx, int h) {
         float sx = h < 0 ? e.getX(idx) : e.getHistoricalX(idx, h);
         float sy = h < 0 ? e.getY(idx) : e.getHistoricalY(idx, h);
-        float x = Math.max(0, Math.min(Ink.W, (sx - ox) / scale));
-        float y = Math.max(0, Math.min(Ink.H, (sy - oy) / scale));
+        float docX = (sx - ox) / scale, docY = (sy - oy) / scale;
         if (erasing) {
-            eraseAt(x, y);
+            int p = pageAt(docY);
+            eraseAt(pages.get(p), docX, docY - pageTop(p));
             return;
         }
         Ink.Stroke s = current;
         if (s == null || snapped) return;
+        float x = Math.max(0, Math.min(Ink.W, docX));
+        float y = Math.max(0, Math.min(Ink.H, docY - pageTop(currentPage)));
         // Se movió: vuelve a contar el tiempo quieto.
         if (Float.isNaN(holdX) || Math.hypot(x - holdX, y - holdY) > 4) {
             holdX = x;
@@ -412,9 +645,8 @@ final class InkView extends View {
             if (s.n == 1) highlighterPath.moveTo(x, y);
             else highlighterPath.lineTo(x, y);
             invalidate();
-        } else if (s.n > 1 && layerScale == scale && layerOx == ox && layerOy == oy) {
-            layerCanvas.save();
-            toPage(layerCanvas, scale, ox, oy);
+        } else if (s.n > 1 && layerAligned()) {
+            onLayerPage(currentPage);
             drawSegment(layerCanvas, s, s.n - 1);
             layerCanvas.restore();
             invalidate();
@@ -459,22 +691,23 @@ final class InkView extends View {
                 else highlighterPath.lineTo(s.x(i), s.y(i));
             }
         } else {
-            layerCanvas.save();
-            toPage(layerCanvas, scale, ox, oy);
+            onLayerPage(currentPage);
             drawStroke(layerCanvas, s);
             layerCanvas.restore();
         }
         invalidate();
     }
 
-    private void eraseAt(float x, float y) {
+    private void eraseAt(Ink.Page page, float x, float y) {
         float r = 10;
         boolean any = false;
         for (int i = page.strokes.size() - 1; i >= 0; i--) {
             Ink.Stroke s = page.strokes.get(i);
             if (s.hits(x, y, r)) {
                 page.strokes.remove(i);
-                erased.add(s);
+                ArrayList<Ink.Stroke> list = erased.get(page);
+                if (list == null) erased.put(page, list = new ArrayList<>());
+                list.add(s);
                 any = true;
             }
         }
@@ -487,41 +720,46 @@ final class InkView extends View {
         if (erasing) {
             erasing = false;
             if (erased.isEmpty()) return;
-            ArrayList<Ink.Stroke> list = new ArrayList<>(erased);
+            LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>> done = new LinkedHashMap<>(erased);
             erased.clear();
-            sendErase(list);
-            push(undo, new Object[] {"erase", list});
+            for (Map.Entry<Ink.Page, ArrayList<Ink.Stroke>> e : done.entrySet()) {
+                sendErase(e.getKey(), e.getValue());
+                listener.onEdited(e.getKey());
+            }
+            push(undo, new Object[] {"erase", done});
             redo.clear();
         } else {
             Ink.Stroke s = current;
             if (s != null && !snapped && autoShapes && toShape(s)) redrawCurrent();
             current = null;
             if (s == null || s.n == 0) return;
+            Ink.Page page = pages.get(currentPage);
             page.strokes.add(s);
             if (Ink.HIGHLIGHTER.equals(s.tool) || s.n == 1) {
-                layerCanvas.save();
-                toPage(layerCanvas, scale, ox, oy);
+                onLayerPage(currentPage);
                 drawStroke(layerCanvas, s);
                 layerCanvas.restore();
                 invalidate();
             }
-            sendStroke(s);
-            ArrayList<Ink.Stroke> one = new ArrayList<>();
-            one.add(s);
+            sendStroke(page, s);
+            LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>> one = new LinkedHashMap<>();
+            ArrayList<Ink.Stroke> list = new ArrayList<>();
+            list.add(s);
+            one.put(page, list);
             push(undo, new Object[] {"add", one});
             redo.clear();
+            listener.onEdited(page);
         }
-        listener.onEdited();
         notifyUndo();
     }
 
-    private void sendStroke(Ink.Stroke s) {
+    private void sendStroke(Ink.Page page, Ink.Stroke s) {
         page.version++;
         listener.onOp("{\"t\":\"stroke\",\"page\":\"" + page.id + "\",\"version\":" + page.version
                 + ",\"stroke\":" + s.toJson() + "}");
     }
 
-    private void sendErase(ArrayList<Ink.Stroke> list) {
+    private void sendErase(Ink.Page page, ArrayList<Ink.Stroke> list) {
         page.version++;
         StringBuilder ids = new StringBuilder();
         for (Ink.Stroke s : list) ids.append(ids.length() > 0 ? "," : "").append('"').append(s.id).append('"');
@@ -546,26 +784,30 @@ final class InkView extends View {
 
     /**
      * Deshace (o rehace) la última acción y manda al PC su contraria. Cada
-     * acción es «se añadieron estos trazos» o «se borraron estos trazos».
+     * acción es «se añadieron estos trazos» o «se borraron estos trazos»,
+     * por página.
      */
     @SuppressWarnings("unchecked")
     private void step(ArrayDeque<Object[]> from, ArrayDeque<Object[]> to) {
-        if (page == null || from.isEmpty() || pointerId != -1) return;
+        if (pages.isEmpty() || from.isEmpty() || pointerId != -1) return;
         Object[] a = from.pop();
-        ArrayList<Ink.Stroke> list = (ArrayList<Ink.Stroke>) a[1];
-        if ("add".equals(a[0])) {
-            page.strokes.removeAll(list);
-            sendErase(list);
-            push(to, new Object[] {"erase", list});
-        } else {
-            for (Ink.Stroke s : list) {
-                page.strokes.add(s);
-                sendStroke(s);
+        LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>> byPage = (LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>>) a[1];
+        boolean add = "add".equals(a[0]);
+        for (Map.Entry<Ink.Page, ArrayList<Ink.Stroke>> e : byPage.entrySet()) {
+            Ink.Page page = e.getKey();
+            if (add) {
+                page.strokes.removeAll(e.getValue());
+                sendErase(page, e.getValue());
+            } else {
+                for (Ink.Stroke s : e.getValue()) {
+                    page.strokes.add(s);
+                    sendStroke(page, s);
+                }
             }
-            push(to, new Object[] {"add", list});
+            listener.onEdited(page);
         }
+        push(to, new Object[] {add ? "erase" : "add", byPage});
         renderLayer();
-        listener.onEdited();
         notifyUndo();
     }
 

@@ -33,6 +33,42 @@ struct Args {
     /// No configurar `adb reverse` para las tablets por USB
     #[arg(long)]
     no_usb: bool,
+    /// No abrir el visor en el navegador al arrancar
+    #[arg(long)]
+    no_open: bool,
+    /// Añadir Sync Tablet al menú de aplicaciones (con su icono) y salir
+    #[arg(long, visible_alias = "install")]
+    instalar: bool,
+}
+
+const ICON: &str = include_str!("../android/icon.svg");
+
+/// Acceso directo en el menú: sin ventana propia, abre el visor en el navegador.
+fn install() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let icons = home.join(".local/share/icons/hicolor/scalable/apps");
+    let apps = home.join(".local/share/applications");
+    std::fs::create_dir_all(&icons)?;
+    std::fs::create_dir_all(&apps)?;
+    std::fs::write(icons.join("synctablet.svg"), ICON)?;
+    std::fs::write(
+        apps.join("synctablet.desktop"),
+        format!(
+            "[Desktop Entry]\nType=Application\nName=Sync Tablet\nComment=Apuntes a mano de la tablet, en vivo en el PC\n\
+             Exec=\"{}\"\nIcon=synctablet\nTerminal=false\nCategories=Office;\n",
+            exe.display()
+        ),
+    )?;
+    println!("Sync Tablet ya está en el menú de aplicaciones ({}).", apps.join("synctablet.desktop").display());
+    Ok(())
+}
+
+fn open_viewer(port: u16) {
+    let url = format!("http://localhost:{port}");
+    if std::process::Command::new("xdg-open").arg(&url).spawn().is_err() {
+        tracing::info!("abre {url} en el navegador");
+    }
 }
 
 #[tokio::main]
@@ -44,6 +80,9 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     let args = Args::parse();
+    if args.instalar {
+        return install();
+    }
     let dir = args
         .dir
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("SyncTablet"));
@@ -52,8 +91,21 @@ async fn main() -> Result<()> {
     let state = Arc::new(server::AppState { store: Mutex::new(store), live, devices: Mutex::new(Vec::new()) });
 
     let addr = SocketAddr::new(args.bind, args.port);
-    let listener =
-        tokio::net::TcpListener::bind(addr).await.with_context(|| format!("no se pudo escuchar en {addr}"))?;
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        // Ya estaba abierto (otro doble clic): sólo enseñar el visor.
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            tracing::info!("Sync Tablet ya estaba en marcha");
+            if !args.no_open {
+                open_viewer(args.port);
+            }
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("no se pudo escuchar en {addr}")),
+    };
+    if !args.no_open {
+        open_viewer(args.port);
+    }
     if !args.no_usb {
         tokio::spawn(adb::watch(args.port));
     }

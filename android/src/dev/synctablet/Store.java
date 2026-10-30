@@ -105,6 +105,18 @@ final class Store {
         return p;
     }
 
+    /** Borra una página del cuaderno (no la última que quede). */
+    synchronized boolean deletePage(Ink.Notebook n, String id) {
+        if (n.pages.size() <= 1 || !n.pages.remove(id)) return false;
+        pages.remove(id);
+        versions.remove(id);
+        final File f = new File(pagesDir, id + ".json");
+        writer.execute(f::delete);
+        saveNotebooks();
+        saveVersions();
+        return true;
+    }
+
     synchronized void deleteNotebook(Ink.Notebook n) {
         notebooks.remove(n);
         for (String id : n.pages) {

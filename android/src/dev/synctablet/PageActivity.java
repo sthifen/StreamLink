@@ -14,8 +14,11 @@ import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+
 /**
- * Una página a pantalla completa. Encima flotan, en cristal líquido, la
+ * El cuaderno a pantalla completa, con sus páginas una debajo de otra. Encima flotan, en cristal líquido, la
  * barra de herramientas (arriba) y la paleta de colores y grosores (a la
  * izquierda); al ser flotantes, cambiar de herramienta no mueve nada.
  */
@@ -29,6 +32,8 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable saver = this::save;
+    /** Páginas cambiadas que falta guardar. */
+    private final LinkedHashSet<Ink.Page> dirty = new LinkedHashSet<>();
     private Store store;
     private SyncClient sync;
     private SharedPreferences prefs;
@@ -93,7 +98,17 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
             palette.postInvalidateOnAnimation();
         };
         setContentView(root);
-        showPage();
+        ArrayList<Ink.Page> list = new ArrayList<>();
+        for (String id : notebook.pages) {
+            Ink.Page p = store.page(id);
+            if (p == null) {
+                p = new Ink.Page(id, notebook.id);
+                store.savePage(p);
+            }
+            list.add(p);
+        }
+        ink.setPages(list, index);
+        showTitle();
         refreshTools();
     }
 
@@ -144,6 +159,10 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
         row.addView(icon(IconView.BACK, "Volver a los cuadernos", v -> finish()));
         title = Ui.text(this, "", 15, Ui.ICON, true);
         title.setPadding(Ui.dp(this, 2), 0, Ui.dp(this, 8), 0);
+        title.setMinHeight(Ui.dp(this, 44));
+        title.setGravity(Gravity.CENTER_VERTICAL);
+        title.setContentDescription("Opciones de la página");
+        title.setOnClickListener(v -> pageMenu());
         row.addView(title);
         row.addView(sep(false));
 
@@ -169,8 +188,8 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
         row.addView(redo);
         row.addView(sep(false));
 
-        row.addView(icon(IconView.PREV, "Página anterior", v -> go(index - 1)));
-        row.addView(icon(IconView.NEXT, "Página siguiente", v -> go(index + 1)));
+        row.addView(icon(IconView.PREV, "Página anterior", v -> ink.scrollToPage(index - 1, true)));
+        row.addView(icon(IconView.NEXT, "Página siguiente", v -> ink.scrollToPage(index + 1, true)));
         row.addView(icon(IconView.PLUS, "Página nueva", v -> addPage()));
         row.addView(icon(IconView.PAGE, "Fondo de la hoja", v -> cycleBackground()));
         finger = icon(IconView.HAND, "Dibujar con el dedo", v -> {
@@ -269,22 +288,8 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
         parent.addView(f, new LinearLayout.LayoutParams(Ui.dp(this, 44), Ui.dp(this, 44)));
     }
 
-    private void showPage() {
-        index = Math.max(0, Math.min(notebook.pages.size() - 1, index));
-        Ink.Page p = store.page(notebook.pages.get(index));
-        if (p == null) {
-            p = new Ink.Page(notebook.pages.get(index), notebook.id);
-            store.savePage(p);
-        }
-        ink.setPage(p);
+    private void showTitle() {
         title.setText(notebook.title + "  " + (index + 1) + "/" + notebook.pages.size());
-    }
-
-    private void go(int i) {
-        if (i < 0 || i >= notebook.pages.size() || i == index) return;
-        save();
-        index = i;
-        showPage();
     }
 
     private void addPage() {
@@ -292,12 +297,46 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
         Ink.Page p = store.addPage(notebook);
         sync.sendNotebook(notebook);
         sync.sendPage(p);
-        index = notebook.pages.size() - 1;
-        showPage();
+        ink.appendPage(p);
+        showTitle();
+    }
+
+    private void pageMenu() {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Página " + (index + 1) + " de " + notebook.pages.size())
+                .setItems(new String[] {"Página nueva al final", "Borrar esta página"}, (d, which) -> {
+                    if (which == 0) addPage();
+                    else confirmDeletePage();
+                })
+                .show();
+    }
+
+    private void confirmDeletePage() {
+        if (notebook.pages.size() <= 1) {
+            Ui.toast(this, "Es la única página del cuaderno");
+            return;
+        }
+        final int i = index;
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("¿Borrar la página " + (i + 1) + "?")
+                .setMessage("Se borra de la tablet y del PC.")
+                .setPositiveButton("Borrar", (d, w) -> {
+                    save();
+                    String id = notebook.pages.get(i);
+                    if (!store.deletePage(notebook, id)) return;
+                    dirty.removeIf(p -> p.id.equals(id));
+                    sync.sendNotebook(notebook);
+                    sync.send("{\"t\":\"delete_page\",\"page\":\"" + id + "\"}");
+                    ink.removePage(i);
+                    showTitle();
+                })
+                .setNegativeButton("Cancelar", null)
+                .show();
     }
 
     private void cycleBackground() {
-        Ink.Page p = ink.page();
+        Ink.Page p = ink.visiblePage();
+        if (p == null) return;
         int i = 0;
         while (i < BACKGROUNDS.length && !BACKGROUNDS[i].equals(p.background)) i++;
         int next = (i + 1) % BACKGROUNDS.length;
@@ -307,7 +346,8 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
 
     private void save() {
         main.removeCallbacks(saver);
-        if (ink != null && ink.page() != null) store.savePage(ink.page());
+        for (Ink.Page p : dirty) store.savePage(p);
+        dirty.clear();
     }
 
     // ---- InkView.Listener ----
@@ -318,9 +358,22 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
     }
 
     @Override
-    public void onEdited() {
+    public void onEdited(Ink.Page page) {
+        dirty.add(page);
         main.removeCallbacks(saver);
         main.postDelayed(saver, 500);
+    }
+
+    @Override
+    public void onPageVisible(int i) {
+        index = i;
+        showTitle();
+    }
+
+    @Override
+    public void onPullAddPage() {
+        addPage();
+        Ui.toast(this, "Página " + notebook.pages.size());
     }
 
     @Override

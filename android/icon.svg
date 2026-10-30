@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 108 108">
+  <!-- Sync Tablet: una tablet dentro de dos flechas de sincronización. -->
+  <rect width="108" height="108" rx="22" fill="#0F766E"/>
+  <g fill="none" stroke="#CCFBF1" stroke-width="6" stroke-linecap="round">
+    <path d="M24,46 A31,31 0 0 1 80,34"/>
+    <path d="M84,62 A31,31 0 0 1 28,74"/>
+  </g>
+  <path fill="#CCFBF1" d="M86,24 L87,42 L70,37 Z"/>
+  <path fill="#CCFBF1" d="M22,84 L21,66 L38,71 Z"/>
+  <rect x="38" y="34" width="32" height="42" rx="5" fill="#FFFFFF"/>
+  <rect x="41" y="38" width="26" height="32" rx="2" fill="#2DD4BF"/>
+  <circle cx="54" cy="73" r="1.6" fill="#0F766E"/>
+  <path fill="#FFFFFF" d="M47,48 H61 V51 H47 Z M47,55 H58 V58 H47 Z"/>
+</svg>
