@@ -3,12 +3,13 @@ package dev.synctablet;
 import android.animation.ValueAnimator;
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.BlurMaskFilter;
 import android.graphics.Canvas;
-import android.graphics.Color;
 import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
+import android.os.SystemClock;
 import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
@@ -18,32 +19,35 @@ import android.view.animation.DecelerateInterpolator;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * El cuaderno: todas sus páginas una debajo de otra. El lápiz dibuja; los
- * dedos desplazan (con inercia) y hacen zoom. Al final del cuaderno, seguir
- * tirando hacia arriba crea una página nueva.
+ * El cuaderno: todas sus páginas una debajo de otra. El lápiz dibuja con la
+ * herramienta elegida; los dedos desplazan (con inercia), hacen zoom y
+ * mueven lo seleccionado. Al final del cuaderno, tirar hacia arriba y
+ * mantener crea una página nueva.
  *
  * Rechazo de la palma: mientras el lápiz toca, los dedos se ignoran, y los
- * dedos sólo dibujan si se activa «Dibujar con el dedo» (tablets sin lápiz).
- * La punta de goma o el botón del lápiz borran.
+ * dedos sólo dibujan si se activa «Dibujar con el dedo». La punta de goma o
+ * el botón del lápiz borran.
  *
- * Para que el trazo vaya pegado al lápiz:
- * - lo ya dibujado vive en un bitmap (`layer`) que cubre la pantalla y media
- *   pantalla más por arriba y por abajo; al desplazar se mueve ese bitmap y
- *   sólo se rehace al salirse de ese margen, al hacer zoom o al borrar;
- * - cada tramo nuevo de pluma se pinta directamente en el bitmap;
- * - se usan los puntos intermedios de cada MotionEvent y
- *   `requestUnbufferedDispatch` para recibirlos sin esperar al vsync.
+ * Para que el trazo vaya pegado al lápiz, lo ya dibujado vive en un bitmap
+ * (`layer`) que cubre la pantalla y media pantalla más por arriba y por
+ * abajo; cada tramo nuevo se pinta directamente en él, y se usan los puntos
+ * intermedios de cada MotionEvent con `requestUnbufferedDispatch`.
+ *
+ * Deshacer: los trazos sueltos se deshacen con su operación contraria; lo
+ * demás (lazo, goma parcial, imágenes, textos) guardando una copia de la
+ * página antes y después.
  */
 final class InkView extends View {
-    static final int PEN = 0, HIGHLIGHTER = 1, ERASER = 2;
+    static final int PEN = 0, HIGHLIGHTER = 1, ERASER = 2, LASSO = 3, TEXT = 4, LASER = 5, TAPE = 6;
 
     interface Listener {
-        /** Una operación para el PC (trazo, borrado o página entera). */
+        /** Un mensaje para el PC (trazo, borrado, página entera, láser). */
         void onOp(String json);
         /** Esa página cambió: hay que guardarla. */
         void onEdited(Ink.Page page);
@@ -52,6 +56,10 @@ final class InkView extends View {
         void onPageVisible(int index);
         /** Se tiró hacia arriba al final del cuaderno: crear una página. */
         void onPullAddPage();
+        /** Hay (o ya no hay) algo seleccionado con el lazo. */
+        void onSelection(boolean active);
+        /** Con la herramienta de texto: crear (item null) o editar un cuadro. */
+        void onTextRequest(int page, Ink.Item item, float x, float y);
     }
 
     private static final int DESK = 0xFFDDE2E8;
@@ -59,12 +67,17 @@ final class InkView extends View {
     /** Separación entre páginas, en unidades de página. */
     private static final float GAP = 36;
     private static final float PULL_DP = 110, PULL_MAX_DP = 260;
+    private static final long PULL_HOLD_MS = 220, HOLD_MS = 550, LASER_MS = 1200;
 
     int tool = PEN;
+    /** Tipo de lápiz de la pluma: pen, pencil, brush o calligraphy. */
+    String penKind = Ink.PEN;
     int penColor = 0xFF111827;
     float penWidth = 3f;
     int highlighterColor = 0xFFFFD60A;
     float highlighterWidth = 24f;
+    /** Goma parcial: borra sólo lo que toca, no el trazo entero. */
+    boolean partialEraser;
     boolean fingerDraws;
     /** Convertir cada trazo en figura si lo parece (sin tener que esperar). */
     boolean autoShapes;
@@ -73,12 +86,12 @@ final class InkView extends View {
     /** Tras cada fotograma (para que el cristal de encima se actualice). */
     Runnable onFrame;
 
+    private final PageRenderer renderer;
     private final ArrayList<Ink.Page> pages = new ArrayList<>();
     private Listener listener;
     private int visible = -1;
 
-    // Pantalla = documento · scale + (ox, oy). El documento son las páginas
-    // apiladas: la página i empieza en y = i · (H + GAP).
+    // Pantalla = documento · scale + (ox, oy). La página i empieza en y = i · (H + GAP).
     private float scale = 1, ox, oy, fitScale = 1;
     private boolean fitted;
     private int pendingScroll = -1;
@@ -93,56 +106,73 @@ final class InkView extends View {
     private ValueAnimator scroller;
     private float focusX = Float.NaN, focusY = Float.NaN;
     private int fingers;
-    private boolean pulled;
-    /** El gesto empezó ya al final: sólo entonces se puede tirar por una página nueva. */
-    private boolean atEnd;
-    /** Cuándo pasó del umbral (un tirón rápido de paso no crea páginas). */
-    private long readySince;
-    private static final long PULL_HOLD_MS = 220;
+    private boolean pulled, atEnd;
+    private long readySince, fingerDownAt;
+    private float fingerDownX, fingerDownY;
 
-    private Ink.Stroke current;
-    private int currentPage;
+    // Lo que hace el puntero que dibuja.
+    private static final int NONE = 0, STROKE = 1, ERASE = 2, LASSO_DRAW = 3, DRAG = 4, LASER_DRAW = 5, TEXT_TAP = 6;
+    private int mode = NONE;
     private int pointerId = -1;
-    private boolean erasing;
-    private final LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>> erased = new LinkedHashMap<>();
-    private final Path highlighterPath = new Path();
-    // Mantener el lápiz quieto al final de un trazo lo convierte en figura.
-    private static final long HOLD_MS = 550;
-    private final Runnable holdCheck = this::snapIfHeld;
+    private int currentPage;
+    private Ink.Stroke current;
     private boolean snapped;
     private float holdX, holdY;
+    private final Runnable holdCheck = this::snapIfHeld;
+    private final LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>> erased = new LinkedHashMap<>();
+    /** Goma parcial: copia de cada página tocada, antes del cambio. */
+    private final LinkedHashMap<Ink.Page, String> before = new LinkedHashMap<>();
 
-    /** Cada acción: {"add" | "erase", página → trazos}. */
+    // Lazo y selección (en coordenadas de la página selPage).
+    private final ArrayList<Float> lasso = new ArrayList<>();
+    private int selPage = -1;
+    private final ArrayList<Ink.Stroke> selStrokes = new ArrayList<>();
+    private final ArrayList<Ink.Item> selItems = new ArrayList<>();
+    private final RectF selBox = new RectF();
+    private boolean scaling;
+    private float dragX, dragY, tdx, tdy, tk = 1;
+
+    // Láser: estelas (en coordenadas del documento) que se desvanecen; no se guardan.
+    private final ArrayList<float[]> laserTrails = new ArrayList<>();
+    private final ArrayList<Long> laserEnds = new ArrayList<>();
+    private float[] laser = new float[0];
+    private int laserN;
+
+    /** Cintas destapadas (sólo en esta tablet). */
+    private final HashSet<String> revealed = new HashSet<>();
+
+    /** Cada acción: {"add" | "erase", página → trazos} o {"snap", página → [antes, después]}. */
     private final ArrayDeque<Object[]> undo = new ArrayDeque<>(), redo = new ArrayDeque<>();
 
-    private final Paint ink = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint lines = new Paint();
-    private final Paint sheet = new Paint();
     private final Paint shade = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint dashed = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint handle = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint laserPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint label = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final float density;
 
     InkView(Context c) {
         super(c);
-        ink.setStyle(Paint.Style.STROKE);
-        ink.setStrokeCap(Paint.Cap.ROUND);
-        ink.setStrokeJoin(Paint.Join.ROUND);
-        lines.setColor(0xFFC9D3E3);
-        lines.setStrokeWidth(1);
-        sheet.setColor(Color.WHITE);
+        renderer = new PageRenderer(c);
+        density = c.getResources().getDisplayMetrics().density;
         shade.setColor(0x26000000);
-        float d = c.getResources().getDisplayMetrics().density;
         dashed.setStyle(Paint.Style.STROKE);
-        dashed.setStrokeWidth(2 * d);
-        dashed.setColor(0xFF9CA3AF);
-        dashed.setPathEffect(new DashPathEffect(new float[] {10 * d, 8 * d}, 0));
+        dashed.setStrokeWidth(2 * density);
+        dashed.setColor(0xFF6B7280);
+        dashed.setPathEffect(new DashPathEffect(new float[] {10 * density, 8 * density}, 0));
+        handle.setColor(0xFF1F2937);
+        laserPaint.setStyle(Paint.Style.STROKE);
+        laserPaint.setStrokeCap(Paint.Cap.ROUND);
+        laserPaint.setStrokeJoin(Paint.Join.ROUND);
+        laserPaint.setColor(0xFFEF4444);
+        laserPaint.setMaskFilter(new BlurMaskFilter(3 * density, BlurMaskFilter.Blur.SOLID));
         label.setColor(0xFF4B5563);
         label.setTextSize(16 * c.getResources().getDisplayMetrics().scaledDensity);
         label.setTextAlign(Paint.Align.CENTER);
         scaler = new ScaleGestureDetector(c, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override
-            public boolean onScale(ScaleGestureDetector det) {
-                zoomAround(det.getFocusX(), det.getFocusY(), det.getScaleFactor());
+            public boolean onScale(ScaleGestureDetector d) {
+                zoomAround(d.getFocusX(), d.getFocusY(), d.getScaleFactor());
                 return true;
             }
         });
@@ -153,13 +183,18 @@ final class InkView extends View {
         listener = l;
     }
 
+    PageRenderer renderer() {
+        return renderer;
+    }
+
     /** Las páginas del cuaderno, empezando por la `show`. */
     void setPages(List<Ink.Page> list, int show) {
         pages.clear();
         pages.addAll(list);
         current = null;
+        mode = NONE;
         pointerId = -1;
-        erasing = false;
+        clearSelection();
         undo.clear();
         redo.clear();
         visible = -1;
@@ -179,7 +214,7 @@ final class InkView extends View {
     void removePage(int i) {
         if (i < 0 || i >= pages.size()) return;
         Ink.Page gone = pages.remove(i);
-        // Sus acciones ya no se pueden deshacer.
+        clearSelection();
         undo.removeIf(a -> ((Map<?, ?>) a[1]).containsKey(gone));
         redo.removeIf(a -> ((Map<?, ?>) a[1]).containsKey(gone));
         notifyUndo();
@@ -196,14 +231,99 @@ final class InkView extends View {
         return visible >= 0 && visible < pages.size() ? pages.get(visible) : null;
     }
 
+    int visibleIndex() {
+        return visible;
+    }
+
+    void refresh() {
+        renderLayer();
+    }
+
     void setBackground(String bg) {
         Ink.Page page = visiblePage();
-        if (page == null || bg.equals(page.background)) return;
+        if (page == null || (bg.equals(page.background) && page.bgAsset == null)) return;
+        String old = page.toJson();
         page.background = bg;
+        commitSnapshot(page, old);
+    }
+
+    // ---- Cambios con copia de la página (deshacer) ----
+
+    private void sendPage(Ink.Page page) {
         page.version++;
         listener.onOp("{\"t\":\"page\",\"page\":" + page.toJson() + "}");
         listener.onEdited(page);
+    }
+
+    /** Ya cambiada la página: mandarla entera y apuntar cómo deshacerlo. */
+    private void commitSnapshot(Ink.Page page, String old) {
+        LinkedHashMap<Ink.Page, String[]> m = new LinkedHashMap<>();
+        m.put(page, new String[] {old, page.toJson()});
+        sendPage(page);
+        push(undo, new Object[] {"snap", m});
+        redo.clear();
         renderLayer();
+        notifyUndo();
+    }
+
+    private void restore(Ink.Page page, String json) {
+        try {
+            page.copyFrom(Ink.Page.fromJson(json));
+        } catch (org.json.JSONException e) {
+            return;
+        }
+        sendPage(page);
+    }
+
+    // ---- Elementos: imágenes y textos ----
+
+    /** Inserta una imagen en la página que se ve y la deja seleccionada. */
+    void insertImage(String asset, int bw, int bh) {
+        Ink.Page page = visiblePage();
+        if (page == null) return;
+        int index = visible;
+        String old = page.toJson();
+        Ink.Item it = new Ink.Item(Ink.newId(), "image");
+        it.asset = asset;
+        it.w = Math.min(560, Ink.W - 80);
+        it.h = it.w * bh / Math.max(1, bw);
+        if (it.h > Ink.H - 160) {
+            it.h = Ink.H - 160;
+            it.w = it.h * bw / Math.max(1, bh);
+        }
+        // Centrada en la parte de la hoja que se ve.
+        float viewY = (getHeight() / 2f - oy) / scale - pageTop(index);
+        it.x = (Ink.W - it.w) / 2;
+        it.y = Math.max(40, Math.min(Ink.H - it.h - 40, viewY - it.h / 2));
+        page.items.add(it);
+        commitSnapshot(page, old);
+        clearSelection();
+        selPage = index;
+        selItems.add(it);
+        updateSelBox();
+        listener.onSelection(true);
+        invalidate();
+    }
+
+    /** Crea o cambia un cuadro de texto (texto vacío: se borra). */
+    void putText(int index, Ink.Item item, String text, float size, int color, float x, float y) {
+        if (index < 0 || index >= pages.size()) return;
+        Ink.Page page = pages.get(index);
+        String old = page.toJson();
+        if (item == null) {
+            if (text.trim().isEmpty()) return;
+            item = new Ink.Item(Ink.newId(), "text");
+            item.x = x;
+            item.y = y;
+            item.w = Math.max(200, Ink.W - x - 40);
+            page.items.add(item);
+        } else if (text.trim().isEmpty()) {
+            page.items.remove(item);
+        }
+        item.text = text;
+        item.size = size;
+        item.color = color;
+        commitSnapshot(page, old);
     }
 
     // ---- Vista: encajar, zoom y desplazamiento ----
@@ -223,12 +343,11 @@ final class InkView extends View {
     }
 
     private float margin() {
-        return MARGIN_DP * getResources().getDisplayMetrics().density;
+        return MARGIN_DP * density;
     }
 
     @Override
     protected void onSizeChanged(int w, int h, int ow, int oh) {
-        // Al girar la tablet: volver a encajar, en la misma página.
         if (fitted && visible >= 0) pendingScroll = visible;
         fitted = false;
         layout();
@@ -267,27 +386,23 @@ final class InkView extends View {
         invalidate();
     }
 
-    /** Límite de arriba y de abajo de oy (sin contar el tirón del final). */
     private float minOy() {
-        float h = getHeight();
-        return Math.min(topInset + margin(), h - margin() - docHeight() * scale);
+        return Math.min(topInset + margin(), getHeight() - margin() - docHeight() * scale);
     }
 
     private float maxOy() {
         return topInset + margin();
     }
 
-    /** Cuánto se ha tirado más allá del final del cuaderno, en px. */
     private float overscroll() {
         return Math.max(0, minOy() - oy);
     }
 
-    /** Dentro de límites; con `pulling`, deja tirar más allá del final. */
     private void clampView(boolean pulling) {
         float w = getWidth(), pw = Ink.W * scale, m = margin();
         if (pw <= w - 2 * m) ox = (w - pw) / 2;
         else ox = Math.max(w - m - pw, Math.min(m, ox));
-        float pullMax = pulling ? PULL_MAX_DP * getResources().getDisplayMetrics().density : 0;
+        float pullMax = pulling ? PULL_MAX_DP * density : 0;
         oy = Math.max(minOy() - pullMax, Math.min(maxOy(), oy));
         notifyVisible();
     }
@@ -303,15 +418,15 @@ final class InkView extends View {
 
     void scrollToPage(int i, boolean animate) {
         if (i < 0 || i >= pages.size()) return;
-        float target = topInset + margin() - pageTop(i) * scale;
         float save = oy;
-        oy = target;
+        oy = topInset + margin() - pageTop(i) * scale;
         clampView(false);
-        target = oy;
+        float target = oy;
         oy = save;
         if (animate) animateOy(target, 380);
         else {
             oy = target;
+            notifyVisible();
             afterScroll();
         }
     }
@@ -329,7 +444,6 @@ final class InkView extends View {
         scroller.start();
     }
 
-    /** Tras desplazar: si el bitmap ya no cubre lo que se ve, rehacerlo. */
     private void afterScroll() {
         if (layerScale != scale || Math.abs(ox - layerOx) > 1 || Math.abs(oy - layerOy) > pad * 0.7f) renderLayer();
         else invalidate();
@@ -341,7 +455,6 @@ final class InkView extends View {
 
     // ---- Dibujo ----
 
-    /** Prepara el canvas del bitmap para dibujar en la página i. */
     private void onLayerPage(int i) {
         layerCanvas.save();
         layerCanvas.translate(layerOx, layerOy + pad);
@@ -349,7 +462,23 @@ final class InkView extends View {
         layerCanvas.translate(0, pageTop(i));
     }
 
-    /** Rehace el bitmap con todo lo dibujado, con la vista actual. */
+    /** Pantalla → página i en el canvas dado. */
+    private void onScreenPage(Canvas c, int i) {
+        c.save();
+        c.translate(ox, oy);
+        c.scale(scale, scale);
+        c.translate(0, pageTop(i));
+    }
+
+    /** Ids que no se pintan en el bitmap (la selección mientras se arrastra). */
+    private HashSet<String> hidden(int page) {
+        if (mode != DRAG || page != selPage) return null;
+        HashSet<String> h = new HashSet<>();
+        for (Ink.Stroke s : selStrokes) h.add(s.id);
+        for (Ink.Item it : selItems) h.add(it.id);
+        return h;
+    }
+
     private void renderLayer() {
         if (layer == null) return;
         Canvas c = layerCanvas;
@@ -361,50 +490,12 @@ final class InkView extends View {
         for (int i = 0; i < pages.size(); i++) {
             float y = pageTop(i);
             if (y > bottom || y + Ink.H < top) continue;
-            Ink.Page p = pages.get(i);
             onLayerPage(i);
             c.drawRect(3, 5, Ink.W + 3, Ink.H + 5, shade);
-            c.drawRect(0, 0, Ink.W, Ink.H, sheet);
-            drawBackground(c, p);
-            for (Ink.Stroke s : p.strokes) drawStroke(c, s);
+            renderer.drawPage(c, pages.get(i), scale, hidden(i), revealed);
             c.restore();
         }
         invalidate();
-    }
-
-    private void drawBackground(Canvas c, Ink.Page p) {
-        if (Ink.PLAIN.equals(p.background)) return;
-        lines.setStrokeWidth(1 / Math.max(scale, 0.01f));
-        for (float y = 80; y < Ink.H; y += 40) c.drawLine(0, y, Ink.W, y, lines);
-        if (Ink.GRID.equals(p.background)) for (float x = 40; x < Ink.W; x += 40) c.drawLine(x, 0, x, Ink.H, lines);
-    }
-
-    private void drawStroke(Canvas c, Ink.Stroke s) {
-        if (s.n == 0) return;
-        ink.setColor(s.color);
-        if (Ink.HIGHLIGHTER.equals(s.tool)) {
-            ink.setAlpha(90);
-            ink.setStrokeWidth(s.width);
-            Path p = new Path();
-            p.moveTo(s.x(0), s.y(0));
-            for (int i = 1; i < s.n; i++) p.lineTo(s.x(i), s.y(i));
-            if (s.n == 1) p.lineTo(s.x(0) + 0.01f, s.y(0));
-            c.drawPath(p, ink);
-            ink.setAlpha(255);
-            return;
-        }
-        if (s.n == 1) {
-            ink.setStrokeWidth(Ink.pressureWidth(s.width, s.p(0)));
-            c.drawPoint(s.x(0), s.y(0), ink);
-            return;
-        }
-        for (int i = 1; i < s.n; i++) drawSegment(c, s, i);
-    }
-
-    private void drawSegment(Canvas c, Ink.Stroke s, int i) {
-        ink.setColor(s.color);
-        ink.setStrokeWidth(Ink.pressureWidth(s.width, (s.p(i - 1) + s.p(i)) / 2));
-        c.drawLine(s.x(i - 1), s.y(i - 1), s.x(i), s.y(i), ink);
     }
 
     @Override
@@ -413,7 +504,6 @@ final class InkView extends View {
         if (layerScale == scale) {
             c.drawBitmap(layer, ox - layerOx, oy - layerOy - pad, null);
         } else {
-            // En pleno zoom: estirar lo que había; se rehace al soltar.
             c.drawColor(DESK);
             float k = scale / layerScale;
             c.save();
@@ -422,37 +512,95 @@ final class InkView extends View {
             c.drawBitmap(layer, 0, 0, null);
             c.restore();
         }
-        if (current != null && Ink.HIGHLIGHTER.equals(current.tool) && current.n > 0) {
-            c.save();
-            c.translate(ox, oy);
-            c.scale(scale, scale);
-            c.translate(0, pageTop(currentPage));
-            ink.setColor(current.color);
-            ink.setAlpha(90);
-            ink.setStrokeWidth(current.width);
-            c.drawPath(highlighterPath, ink);
-            ink.setAlpha(255);
+        if (mode == STROKE && current != null && current.n > 0
+                && (Ink.HIGHLIGHTER.equals(current.tool) || Ink.TAPE.equals(current.tool))) {
+            onScreenPage(c, currentPage);
+            renderer.drawStroke(c, current, false);
             c.restore();
         }
+        drawLasso(c);
+        drawSelection(c);
+        drawLasers(c);
         drawPull(c);
-        // Sólo el dibujo de verdad, no las copias que hace el cristal.
         if (onFrame != null && c.isHardwareAccelerated()) onFrame.run();
     }
 
-    /** Debajo de la última página: la página nueva que aparece al tirar. */
+    private void drawLasso(Canvas c) {
+        if (mode != LASSO_DRAW || lasso.size() < 4) return;
+        Path p = new Path();
+        p.moveTo(lasso.get(0), lasso.get(1));
+        for (int i = 2; i + 1 < lasso.size(); i += 2) p.lineTo(lasso.get(i), lasso.get(i + 1));
+        onScreenPage(c, currentPage);
+        dashed.setStrokeWidth(2 * density / scale);
+        c.drawPath(p, dashed);
+        dashed.setStrokeWidth(2 * density);
+        c.restore();
+    }
+
+    private void drawSelection(Canvas c) {
+        if (selPage < 0) return;
+        onScreenPage(c, selPage);
+        if (mode == DRAG) {
+            // La selección, movida/escalada en vivo.
+            c.save();
+            c.translate(selBox.left + tdx, selBox.top + tdy);
+            c.scale(tk, tk);
+            c.translate(-selBox.left, -selBox.top);
+            for (Ink.Item it : selItems) renderer.drawItem(c, it);
+            for (Ink.Stroke s : selStrokes) renderer.drawStroke(c, s, revealed.contains(s.id));
+            c.restore();
+        }
+        RectF b = shownBox();
+        dashed.setStrokeWidth(1.5f * density / scale);
+        c.drawRect(b, dashed);
+        dashed.setStrokeWidth(2 * density);
+        c.drawCircle(b.right, b.bottom, 9 * density / scale, handle);
+        c.restore();
+    }
+
+    /** La caja de la selección con el arrastre en curso. */
+    private RectF shownBox() {
+        return new RectF(selBox.left + tdx, selBox.top + tdy,
+                selBox.left + tdx + selBox.width() * tk, selBox.top + tdy + selBox.height() * tk);
+    }
+
+    private void drawLasers(Canvas c) {
+        long now = SystemClock.uptimeMillis();
+        boolean any = false;
+        for (int t = laserTrails.size() - 1; t >= 0; t--) {
+            long end = laserEnds.get(t);
+            if (end > 0 && now - end > LASER_MS) {
+                laserTrails.remove(t);
+                laserEnds.remove(t);
+                continue;
+            }
+            float[] p = laserTrails.get(t);
+            int alpha = end == 0 ? 255 : (int) (255 * (1 - (now - end) / (float) LASER_MS));
+            Path path = new Path();
+            for (int i = 0; i + 1 < p.length; i += 2) {
+                if (i == 0) path.moveTo(ox + p[i] * scale, oy + p[i + 1] * scale);
+                else path.lineTo(ox + p[i] * scale, oy + p[i + 1] * scale);
+            }
+            laserPaint.setAlpha(alpha);
+            laserPaint.setStrokeWidth(5 * density);
+            c.drawPath(path, laserPaint);
+            any = true;
+        }
+        if (any) postInvalidateOnAnimation();
+    }
+
     private void drawPull(Canvas c) {
         float over = overscroll();
         if (over <= 0 || pages.isEmpty()) return;
-        float top = oy + (pageTop(pages.size()) ) * scale;
+        float top = oy + pageTop(pages.size()) * scale;
         float left = ox, right = ox + Ink.W * scale, bottom = Math.min(getHeight() - margin() / 2, top + Ink.H * scale);
         if (bottom <= top + 8) return;
-        float r = 6 * getResources().getDisplayMetrics().density;
+        float r = 6 * density;
         c.drawRoundRect(new RectF(left, top, right, bottom), r, r, dashed);
-        boolean ready = over >= PULL_DP * getResources().getDisplayMetrics().density;
-        float cy = (top + bottom) / 2;
+        boolean ready = over >= PULL_DP * density;
         label.setFakeBoldText(ready);
         c.drawText(ready ? "Suelta para una página nueva" : "Tira para una página nueva", (left + right) / 2,
-                cy + label.getTextSize() / 3, label);
+                (top + bottom) / 2 + label.getTextSize() / 3, label);
     }
 
     // ---- Entrada ----
@@ -475,6 +623,17 @@ final class InkView extends View {
         return h < 0 ? e.getPressure(idx) : e.getHistoricalPressure(idx, h);
     }
 
+    /** ¿El punto (en pantalla) está sobre la selección? 1 = esquina de escalar, 2 = dentro. */
+    private int selectionHit(float sx, float sy) {
+        if (selPage < 0) return 0;
+        float x = (sx - ox) / scale, y = (sy - oy) / scale - pageTop(selPage);
+        float r = 26 * density / scale;
+        if (Math.hypot(x - selBox.right, y - selBox.bottom) < r) return 1;
+        RectF b = new RectF(selBox);
+        b.inset(-8 * density / scale, -8 * density / scale);
+        return b.contains(x, y) ? 2 : 0;
+    }
+
     @Override
     public boolean onTouchEvent(MotionEvent e) {
         if (pages.isEmpty()) return false;
@@ -483,24 +642,30 @@ final class InkView extends View {
         switch (action) {
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_POINTER_DOWN:
-                if (pointerId == -1 && draws(e, idx)) {
-                    requestUnbufferedDispatch(e);
-                    if (scroller != null) scroller.cancel();
-                    if (!layerAligned()) renderLayer();
-                    pointerId = e.getPointerId(idx);
-                    erasing = erases(e, idx);
-                    if (erasing) erased.clear();
-                    else startStroke(pageAt((e.getY(idx) - oy) / scale));
-                    addPoint(e, idx, -1);
-                    return true;
+                if (pointerId == -1) {
+                    boolean finger = e.getToolType(idx) == MotionEvent.TOOL_TYPE_FINGER;
+                    int hit = fingers == 0 ? selectionHit(e.getX(idx), e.getY(idx)) : 0;
+                    if (hit > 0) {
+                        startDrag(e, idx, hit == 1);
+                        return true;
+                    }
+                    if (draws(e, idx)) {
+                        requestUnbufferedDispatch(e);
+                        if (scroller != null) scroller.cancel();
+                        if (selPage >= 0 && !finger) clearSelection();
+                        if (!layerAligned()) renderLayer();
+                        pointerId = e.getPointerId(idx);
+                        start(e, idx);
+                        return true;
+                    }
                 }
                 break;
             case MotionEvent.ACTION_MOVE:
                 if (pointerId != -1) {
                     int i = e.findPointerIndex(pointerId);
                     if (i >= 0) {
-                        for (int h = 0; h < e.getHistorySize(); h++) addPoint(e, i, h);
-                        addPoint(e, i, -1);
+                        for (int h = 0; h < e.getHistorySize(); h++) move(e, i, h);
+                        move(e, i, -1);
                     }
                     return true;
                 }
@@ -508,26 +673,142 @@ final class InkView extends View {
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_POINTER_UP:
                 if (pointerId == e.getPointerId(idx)) {
-                    finish();
+                    finish(e, idx);
                     return true;
                 }
                 break;
             case MotionEvent.ACTION_CANCEL:
-                if (pointerId != -1) {
-                    // El sistema lo anuló (p. ej. era la palma): fuera el trazo.
-                    current = null;
-                    pointerId = -1;
-                    if (erasing) finish();
-                    renderLayer();
-                }
+                if (pointerId != -1) cancel();
                 break;
         }
-        // Mientras el lápiz dibuja, los dedos no hacen nada.
         if (pointerId != -1) return true;
         return gesture(e);
     }
 
-    /** Dedos: uno desplaza (con inercia), dos desplazan y hacen zoom. */
+    private void start(MotionEvent e, int idx) {
+        float docY = (e.getY(idx) - oy) / scale;
+        currentPage = pageAt(docY);
+        if (erases(e, idx)) {
+            mode = ERASE;
+            erased.clear();
+            before.clear();
+        } else if (tool == LASSO) {
+            mode = LASSO_DRAW;
+            lasso.clear();
+        } else if (tool == TEXT) {
+            mode = TEXT_TAP;
+        } else if (tool == LASER) {
+            mode = LASER_DRAW;
+            laser = new float[256];
+            laserN = 0;
+            laserTrails.add(new float[0]);
+            laserEnds.add(0L);
+        } else {
+            mode = STROKE;
+            String kind = tool == HIGHLIGHTER ? Ink.HIGHLIGHTER : tool == TAPE ? Ink.TAPE : penKind;
+            int color = tool == HIGHLIGHTER ? highlighterColor : tool == TAPE ? PageRenderer.TAPE_COLOR : penColor;
+            float width = tool == HIGHLIGHTER ? highlighterWidth : tool == TAPE ? 34 : penWidth;
+            current = new Ink.Stroke(Ink.newId(), kind, color, width);
+            snapped = false;
+            holdX = holdY = Float.NaN;
+        }
+        move(e, idx, -1);
+    }
+
+    private void move(MotionEvent e, int idx, int h) {
+        float sx = h < 0 ? e.getX(idx) : e.getHistoricalX(idx, h);
+        float sy = h < 0 ? e.getY(idx) : e.getHistoricalY(idx, h);
+        float docX = (sx - ox) / scale, docY = (sy - oy) / scale;
+        switch (mode) {
+            case ERASE: {
+                int p = pageAt(docY);
+                eraseAt(pages.get(p), docX, docY - pageTop(p));
+                return;
+            }
+            case LASSO_DRAW:
+                lasso.add(docX);
+                lasso.add(docY - pageTop(currentPage));
+                invalidate();
+                return;
+            case DRAG:
+                drag(docX, docY - pageTop(selPage));
+                return;
+            case LASER_DRAW:
+                if (2 * laserN + 2 > laser.length) laser = java.util.Arrays.copyOf(laser, laser.length * 2);
+                laser[2 * laserN] = docX;
+                laser[2 * laserN + 1] = docY;
+                laserN++;
+                laserTrails.set(laserTrails.size() - 1, java.util.Arrays.copyOf(laser, 2 * laserN));
+                invalidate();
+                return;
+            case STROKE:
+                addPoint(docX, docY - pageTop(currentPage), pressure(e, idx, h));
+                return;
+            default:
+        }
+    }
+
+    private void finish(MotionEvent e, int idx) {
+        pointerId = -1;
+        removeCallbacks(holdCheck);
+        int m = mode;
+        mode = NONE;
+        switch (m) {
+            case ERASE:
+                finishErase();
+                break;
+            case LASSO_DRAW:
+                finishLasso();
+                break;
+            case DRAG:
+                finishDrag();
+                break;
+            case LASER_DRAW: {
+                laserEnds.set(laserEnds.size() - 1, SystemClock.uptimeMillis());
+                // En vivo al PC (en coordenadas de página), por si se presenta.
+                int p = currentPage;
+                StringBuilder pts = new StringBuilder();
+                for (int i = 0; i < 2 * laserN; i++) {
+                    if (i > 0) pts.append(',');
+                    pts.append(Math.round(i % 2 == 0 ? laser[i] : laser[i] - pageTop(p)));
+                }
+                listener.onOp("{\"t\":\"laser\",\"page\":\"" + pages.get(p).id + "\",\"points\":[" + pts + "]}");
+                invalidate();
+                break;
+            }
+            case TEXT_TAP: {
+                float docX = (e.getX(idx) - ox) / scale, docY = (e.getY(idx) - oy) / scale;
+                int page = pageAt(docY);
+                float x = docX, y = docY - pageTop(page);
+                Ink.Item hit = null;
+                for (Ink.Item it : pages.get(page).items) {
+                    if (!it.isImage() && x >= it.x && x <= it.x + it.w && y >= it.y && y <= it.y + renderer.textHeight(it) + 10) hit = it;
+                }
+                listener.onTextRequest(page, hit, Math.max(20, Math.min(Ink.W - 220, x)), Math.max(20, Math.min(Ink.H - 60, y)));
+                break;
+            }
+            case STROKE:
+                finishStroke();
+                break;
+            default:
+        }
+    }
+
+    private void cancel() {
+        pointerId = -1;
+        removeCallbacks(holdCheck);
+        if (mode == ERASE) finishErase();
+        else if (mode == DRAG) {
+            tdx = tdy = 0;
+            tk = 1;
+        }
+        mode = NONE;
+        current = null;
+        lasso.clear();
+        renderLayer();
+    }
+
+    /** Dedos: uno desplaza (con inercia), dos desplazan y hacen zoom; un toque destapa una cinta. */
     private boolean gesture(MotionEvent e) {
         scaler.onTouchEvent(e);
         int action = e.getActionMasked();
@@ -537,8 +818,15 @@ final class InkView extends View {
             velocity = VelocityTracker.obtain();
             pulled = false;
             atEnd = oy <= minOy() + 2;
+            fingerDownAt = SystemClock.uptimeMillis();
+            fingerDownX = e.getX();
+            fingerDownY = e.getY();
         }
         if (velocity != null) velocity.addMovement(e);
+        if (action == MotionEvent.ACTION_UP && SystemClock.uptimeMillis() - fingerDownAt < 250
+                && Math.hypot(e.getX() - fingerDownX, e.getY() - fingerDownY) < 12 * density) {
+            tap(e.getX(), e.getY());
+        }
         int skip = action == MotionEvent.ACTION_POINTER_UP || action == MotionEvent.ACTION_UP ? e.getActionIndex() : -1;
         float sx = 0, sy = 0;
         int n = 0;
@@ -559,15 +847,14 @@ final class InkView extends View {
         float fx = sx / n, fy = sy / n;
         if (!Float.isNaN(focusX) && action == MotionEvent.ACTION_MOVE) {
             float dy = fy - focusY;
-            // Más allá del final cuesta más tirar (como una goma).
             if (dy < 0 && overscroll() > 0) dy *= 0.45f;
             ox += fx - focusX;
             oy += dy;
             clampView(atEnd);
-            boolean ready = overscroll() >= PULL_DP * getResources().getDisplayMetrics().density;
+            boolean ready = overscroll() >= PULL_DP * density;
             if (ready && !pulled) {
                 performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
-                readySince = android.os.SystemClock.uptimeMillis();
+                readySince = SystemClock.uptimeMillis();
             }
             pulled = ready;
             if (layerScale == scale) afterScroll();
@@ -578,12 +865,28 @@ final class InkView extends View {
         return true;
     }
 
-    /** Dedos fuera: página nueva si se tiró bastante; si no, inercia o volver al sitio. */
+    /** Toque con el dedo: destapa o tapa una cinta; fuera de la selección, la quita. */
+    private void tap(float sx, float sy) {
+        float docX = (sx - ox) / scale, docY = (sy - oy) / scale;
+        int p = pageAt(docY);
+        float x = docX, y = docY - pageTop(p);
+        List<Ink.Stroke> strokes = pages.get(p).strokes;
+        for (int i = strokes.size() - 1; i >= 0; i--) {
+            Ink.Stroke s = strokes.get(i);
+            if (Ink.TAPE.equals(s.tool) && s.hits(x, y, 4)) {
+                if (!revealed.remove(s.id)) revealed.add(s.id);
+                renderLayer();
+                return;
+            }
+        }
+        if (selPage >= 0 && selectionHit(sx, sy) == 0) clearSelection();
+    }
+
     private void release() {
         float over = overscroll();
-        boolean held = pulled && android.os.SystemClock.uptimeMillis() - readySince >= PULL_HOLD_MS;
+        boolean held = pulled && SystemClock.uptimeMillis() - readySince >= PULL_HOLD_MS;
         pulled = false;
-        if (held && over >= PULL_DP * getResources().getDisplayMetrics().density) {
+        if (held && over >= PULL_DP * density) {
             listener.onPullAddPage();
             return;
         }
@@ -599,37 +902,26 @@ final class InkView extends View {
             velocity = null;
         }
         if (Math.abs(vy) > 600 && layerScale == scale) {
-            float target = Math.max(minOy(), Math.min(maxOy(), oy + vy * 0.35f));
-            animateOy(target, 520);
+            animateOy(Math.max(minOy(), Math.min(maxOy(), oy + vy * 0.35f)), 520);
         } else if (!layerAligned()) {
             renderLayer();
         }
     }
 
-    private void startStroke(int page) {
-        currentPage = page;
-        boolean hl = tool == HIGHLIGHTER;
-        current = new Ink.Stroke(Ink.newId(), hl ? Ink.HIGHLIGHTER : Ink.PEN,
-                hl ? highlighterColor : penColor, hl ? highlighterWidth : penWidth);
-        highlighterPath.reset();
-        snapped = false;
-        holdX = holdY = Float.NaN;
-    }
+    // ---- Trazos ----
 
-    private void addPoint(MotionEvent e, int idx, int h) {
-        float sx = h < 0 ? e.getX(idx) : e.getHistoricalX(idx, h);
-        float sy = h < 0 ? e.getY(idx) : e.getHistoricalY(idx, h);
-        float docX = (sx - ox) / scale, docY = (sy - oy) / scale;
-        if (erasing) {
-            int p = pageAt(docY);
-            eraseAt(pages.get(p), docX, docY - pageTop(p));
-            return;
-        }
+    private void addPoint(float docX, float y, float pressure) {
         Ink.Stroke s = current;
         if (s == null || snapped) return;
         float x = Math.max(0, Math.min(Ink.W, docX));
-        float y = Math.max(0, Math.min(Ink.H, docY - pageTop(currentPage)));
-        // Se movió: vuelve a contar el tiempo quieto.
+        y = Math.max(0, Math.min(Ink.H, y));
+        if (Ink.TAPE.equals(s.tool)) {
+            // La cinta va recta del principio al punto actual.
+            if (s.n == 0) s.add(x, y, 1);
+            else s.replace(new float[] {s.x(0), s.y(0), x, y}, 1);
+            invalidate();
+            return;
+        }
         if (Float.isNaN(holdX) || Math.hypot(x - holdX, y - holdY) > 4) {
             holdX = x;
             holdY = y;
@@ -640,22 +932,19 @@ final class InkView extends View {
             float dx = x - s.x(s.n - 1), dy = y - s.y(s.n - 1);
             if (dx * dx + dy * dy < 0.25f) return;
         }
-        s.add(x, y, pressure(e, idx, h));
+        s.add(x, y, pressure);
         if (Ink.HIGHLIGHTER.equals(s.tool)) {
-            if (s.n == 1) highlighterPath.moveTo(x, y);
-            else highlighterPath.lineTo(x, y);
             invalidate();
         } else if (s.n > 1 && layerAligned()) {
             onLayerPage(currentPage);
-            drawSegment(layerCanvas, s, s.n - 1);
+            renderer.drawSegment(layerCanvas, s, s.n - 1);
             layerCanvas.restore();
             invalidate();
         }
     }
 
-    /** El lápiz lleva quieto un rato sin levantarse: ¿era una figura? */
     private void snapIfHeld() {
-        if (current == null || pointerId == -1 || snapped || erasing) return;
+        if (current == null || mode != STROKE || snapped || Ink.TAPE.equals(current.tool)) return;
         if (toShape(current)) {
             snapped = true;
             performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
@@ -663,7 +952,6 @@ final class InkView extends View {
         }
     }
 
-    /** Sustituye el trazo por su figura perfecta, si la reconoce. */
     private boolean toShape(Ink.Stroke s) {
         if (s.n < 3) return false;
         float[] xy = new float[2 * s.n];
@@ -679,47 +967,94 @@ final class InkView extends View {
         return true;
     }
 
-    /** Tras cambiar el trazo en curso: quitar lo pintado y pintarlo de nuevo. */
     private void redrawCurrent() {
         renderLayer();
         Ink.Stroke s = current;
-        if (s == null) return;
-        if (Ink.HIGHLIGHTER.equals(s.tool)) {
-            highlighterPath.reset();
-            for (int i = 0; i < s.n; i++) {
-                if (i == 0) highlighterPath.moveTo(s.x(i), s.y(i));
-                else highlighterPath.lineTo(s.x(i), s.y(i));
-            }
-        } else {
+        if (s != null && !Ink.HIGHLIGHTER.equals(s.tool)) {
             onLayerPage(currentPage);
-            drawStroke(layerCanvas, s);
+            renderer.drawStroke(layerCanvas, s, false);
             layerCanvas.restore();
         }
         invalidate();
     }
 
+    private void finishStroke() {
+        Ink.Stroke s = current;
+        current = null;
+        if (s != null && !snapped && autoShapes && !Ink.TAPE.equals(s.tool) && toShape(s)) renderLayer();
+        if (s == null || s.n == 0 || (Ink.TAPE.equals(s.tool) && s.n < 2)) {
+            renderLayer();
+            return;
+        }
+        Ink.Page page = pages.get(currentPage);
+        page.strokes.add(s);
+        onLayerPage(currentPage);
+        renderer.drawStroke(layerCanvas, s, false);
+        layerCanvas.restore();
+        invalidate();
+        sendStroke(page, s);
+        LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>> one = new LinkedHashMap<>();
+        ArrayList<Ink.Stroke> list = new ArrayList<>();
+        list.add(s);
+        one.put(page, list);
+        push(undo, new Object[] {"add", one});
+        redo.clear();
+        listener.onEdited(page);
+        notifyUndo();
+    }
+
+    // ---- Goma ----
+
     private void eraseAt(Ink.Page page, float x, float y) {
-        float r = 10;
+        float r = partialEraser ? 8 : 10;
         boolean any = false;
         for (int i = page.strokes.size() - 1; i >= 0; i--) {
             Ink.Stroke s = page.strokes.get(i);
-            if (s.hits(x, y, r)) {
+            if (!s.hits(x, y, r)) continue;
+            any = true;
+            if (partialEraser) {
+                if (!before.containsKey(page)) before.put(page, page.toJson());
+                page.strokes.remove(i);
+                page.strokes.addAll(i, split(s, x, y, r + s.width / 2));
+            } else {
                 page.strokes.remove(i);
                 ArrayList<Ink.Stroke> list = erased.get(page);
                 if (list == null) erased.put(page, list = new ArrayList<>());
                 list.add(s);
-                any = true;
             }
         }
         if (any) renderLayer();
     }
 
-    private void finish() {
-        pointerId = -1;
-        removeCallbacks(holdCheck);
-        if (erasing) {
-            erasing = false;
-            if (erased.isEmpty()) return;
+    /** Los trozos del trazo que quedan fuera del círculo de la goma. */
+    private static List<Ink.Stroke> split(Ink.Stroke s, float x, float y, float r) {
+        ArrayList<Ink.Stroke> out = new ArrayList<>();
+        Ink.Stroke piece = null;
+        for (int i = 0; i < s.n; i++) {
+            if (Math.hypot(s.x(i) - x, s.y(i) - y) <= r) {
+                if (piece != null && piece.n >= 2) out.add(piece);
+                piece = null;
+            } else {
+                if (piece == null) piece = new Ink.Stroke(Ink.newId(), s.tool, s.color, s.width);
+                piece.add(s.x(i), s.y(i), s.p(i));
+            }
+        }
+        if (piece != null && piece.n >= 2) out.add(piece);
+        return out;
+    }
+
+    private void finishErase() {
+        if (!before.isEmpty()) {
+            LinkedHashMap<Ink.Page, String[]> m = new LinkedHashMap<>();
+            for (Map.Entry<Ink.Page, String> e : before.entrySet()) {
+                m.put(e.getKey(), new String[] {e.getValue(), e.getKey().toJson()});
+                sendPage(e.getKey());
+            }
+            before.clear();
+            push(undo, new Object[] {"snap", m});
+            redo.clear();
+        }
+        if (!erased.isEmpty()) {
             LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>> done = new LinkedHashMap<>(erased);
             erased.clear();
             for (Map.Entry<Ink.Page, ArrayList<Ink.Stroke>> e : done.entrySet()) {
@@ -728,30 +1063,180 @@ final class InkView extends View {
             }
             push(undo, new Object[] {"erase", done});
             redo.clear();
-        } else {
-            Ink.Stroke s = current;
-            if (s != null && !snapped && autoShapes && toShape(s)) redrawCurrent();
-            current = null;
-            if (s == null || s.n == 0) return;
-            Ink.Page page = pages.get(currentPage);
-            page.strokes.add(s);
-            if (Ink.HIGHLIGHTER.equals(s.tool) || s.n == 1) {
-                onLayerPage(currentPage);
-                drawStroke(layerCanvas, s);
-                layerCanvas.restore();
-                invalidate();
-            }
-            sendStroke(page, s);
-            LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>> one = new LinkedHashMap<>();
-            ArrayList<Ink.Stroke> list = new ArrayList<>();
-            list.add(s);
-            one.put(page, list);
-            push(undo, new Object[] {"add", one});
-            redo.clear();
-            listener.onEdited(page);
         }
         notifyUndo();
     }
+
+    // ---- Lazo y selección ----
+
+    private static boolean inside(ArrayList<Float> poly, float x, float y) {
+        boolean in = false;
+        int n = poly.size() / 2;
+        for (int i = 0, j = n - 1; i < n; j = i++) {
+            float xi = poly.get(2 * i), yi = poly.get(2 * i + 1), xj = poly.get(2 * j), yj = poly.get(2 * j + 1);
+            if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) in = !in;
+        }
+        return in;
+    }
+
+    private void finishLasso() {
+        if (lasso.size() < 6) {
+            lasso.clear();
+            invalidate();
+            return;
+        }
+        Ink.Page page = pages.get(currentPage);
+        clearSelection();
+        for (Ink.Stroke s : page.strokes) {
+            int in = 0;
+            for (int i = 0; i < s.n; i++) if (inside(lasso, s.x(i), s.y(i))) in++;
+            if (in * 2 >= s.n) selStrokes.add(s);
+        }
+        for (Ink.Item it : page.items) {
+            float h = it.isImage() ? it.h : renderer.textHeight(it);
+            if (inside(lasso, it.x + it.w / 2, it.y + h / 2)) selItems.add(it);
+        }
+        lasso.clear();
+        if (selStrokes.isEmpty() && selItems.isEmpty()) {
+            invalidate();
+            return;
+        }
+        selPage = currentPage;
+        updateSelBox();
+        listener.onSelection(true);
+        invalidate();
+    }
+
+    private void updateSelBox() {
+        float l = Float.MAX_VALUE, t = Float.MAX_VALUE, r = -Float.MAX_VALUE, b = -Float.MAX_VALUE;
+        for (Ink.Stroke s : selStrokes) {
+            l = Math.min(l, s.minX - s.width); t = Math.min(t, s.minY - s.width);
+            r = Math.max(r, s.maxX + s.width); b = Math.max(b, s.maxY + s.width);
+        }
+        for (Ink.Item it : selItems) {
+            float h = it.isImage() ? it.h : renderer.textHeight(it);
+            l = Math.min(l, it.x); t = Math.min(t, it.y);
+            r = Math.max(r, it.x + it.w); b = Math.max(b, it.y + h);
+        }
+        selBox.set(l - 6, t - 6, r + 6, b + 6);
+    }
+
+    boolean hasSelection() {
+        return selPage >= 0;
+    }
+
+    void clearSelection() {
+        boolean had = selPage >= 0;
+        selPage = -1;
+        selStrokes.clear();
+        selItems.clear();
+        tdx = tdy = 0;
+        tk = 1;
+        if (had && listener != null) listener.onSelection(false);
+        invalidate();
+    }
+
+    private void startDrag(MotionEvent e, int idx, boolean scale) {
+        pointerId = e.getPointerId(idx);
+        mode = DRAG;
+        scaling = scale;
+        dragX = (e.getX(idx) - ox) / this.scale;
+        dragY = (e.getY(idx) - oy) / this.scale - pageTop(selPage);
+        tdx = tdy = 0;
+        tk = 1;
+        renderLayer();
+    }
+
+    private void drag(float x, float y) {
+        if (scaling) {
+            float w0 = selBox.width(), h0 = selBox.height();
+            float k = Math.max((selBox.width() + x - dragX) / w0, (selBox.height() + y - dragY) / h0);
+            tk = Math.max(0.15f, Math.min(8f, k));
+        } else {
+            tdx = x - dragX;
+            tdy = y - dragY;
+        }
+        invalidate();
+    }
+
+    private void finishDrag() {
+        Ink.Page page = pages.get(selPage);
+        if (tdx == 0 && tdy == 0 && tk == 1) {
+            renderLayer();
+            return;
+        }
+        String old = page.toJson();
+        float ax = selBox.left, ay = selBox.top;
+        for (int i = 0; i < selStrokes.size(); i++) {
+            Ink.Stroke s = selStrokes.get(i), t = s.transformed(ax, ay, tk, tdx, tdy);
+            int at = page.strokes.indexOf(s);
+            if (at >= 0) page.strokes.set(at, t);
+            selStrokes.set(i, t);
+        }
+        for (Ink.Item it : selItems) {
+            it.x = ax + (it.x - ax) * tk + tdx;
+            it.y = ay + (it.y - ay) * tk + tdy;
+            it.w *= tk;
+            it.h *= tk;
+            if (!it.isImage()) it.size *= tk;
+        }
+        tdx = tdy = 0;
+        tk = 1;
+        updateSelBox();
+        commitSnapshot(page, old);
+    }
+
+    /** Recolorea lo seleccionado (trazos y textos). */
+    void recolorSelection(int color) {
+        if (selPage < 0) return;
+        Ink.Page page = pages.get(selPage);
+        String old = page.toJson();
+        for (int i = 0; i < selStrokes.size(); i++) {
+            Ink.Stroke s = selStrokes.get(i);
+            if (Ink.TAPE.equals(s.tool)) continue;
+            Ink.Stroke t = s.copy(s.id, color);
+            int at = page.strokes.indexOf(s);
+            if (at >= 0) page.strokes.set(at, t);
+            selStrokes.set(i, t);
+        }
+        for (Ink.Item it : selItems) if (!it.isImage()) it.color = color;
+        commitSnapshot(page, old);
+    }
+
+    void duplicateSelection() {
+        if (selPage < 0) return;
+        Ink.Page page = pages.get(selPage);
+        String old = page.toJson();
+        ArrayList<Ink.Stroke> strokes = new ArrayList<>();
+        ArrayList<Ink.Item> items = new ArrayList<>();
+        for (Ink.Stroke s : selStrokes) strokes.add(s.copy(Ink.newId(), s.color).transformed(0, 0, 1, 30, 30));
+        for (Ink.Item it : selItems) {
+            Ink.Item c = it.copy(Ink.newId());
+            c.x += 30;
+            c.y += 30;
+            items.add(c);
+        }
+        page.strokes.addAll(strokes);
+        page.items.addAll(items);
+        selStrokes.clear();
+        selStrokes.addAll(strokes);
+        selItems.clear();
+        selItems.addAll(items);
+        updateSelBox();
+        commitSnapshot(page, old);
+    }
+
+    void deleteSelection() {
+        if (selPage < 0) return;
+        Ink.Page page = pages.get(selPage);
+        String old = page.toJson();
+        page.strokes.removeAll(selStrokes);
+        page.items.removeAll(selItems);
+        clearSelection();
+        commitSnapshot(page, old);
+    }
+
+    // ---- PC ----
 
     private void sendStroke(Ink.Page page, Ink.Stroke s) {
         page.version++;
@@ -782,31 +1267,34 @@ final class InkView extends View {
         step(redo, undo);
     }
 
-    /**
-     * Deshace (o rehace) la última acción y manda al PC su contraria. Cada
-     * acción es «se añadieron estos trazos» o «se borraron estos trazos»,
-     * por página.
-     */
     @SuppressWarnings("unchecked")
     private void step(ArrayDeque<Object[]> from, ArrayDeque<Object[]> to) {
         if (pages.isEmpty() || from.isEmpty() || pointerId != -1) return;
+        clearSelection();
         Object[] a = from.pop();
-        LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>> byPage = (LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>>) a[1];
-        boolean add = "add".equals(a[0]);
-        for (Map.Entry<Ink.Page, ArrayList<Ink.Stroke>> e : byPage.entrySet()) {
-            Ink.Page page = e.getKey();
-            if (add) {
-                page.strokes.removeAll(e.getValue());
-                sendErase(page, e.getValue());
-            } else {
-                for (Ink.Stroke s : e.getValue()) {
-                    page.strokes.add(s);
-                    sendStroke(page, s);
+        if ("snap".equals(a[0])) {
+            LinkedHashMap<Ink.Page, String[]> m = (LinkedHashMap<Ink.Page, String[]>) a[1];
+            boolean undoing = from == undo;
+            for (Map.Entry<Ink.Page, String[]> e : m.entrySet()) restore(e.getKey(), e.getValue()[undoing ? 0 : 1]);
+            push(to, a);
+        } else {
+            LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>> byPage = (LinkedHashMap<Ink.Page, ArrayList<Ink.Stroke>>) a[1];
+            boolean add = "add".equals(a[0]);
+            for (Map.Entry<Ink.Page, ArrayList<Ink.Stroke>> e : byPage.entrySet()) {
+                Ink.Page page = e.getKey();
+                if (add) {
+                    page.strokes.removeAll(e.getValue());
+                    sendErase(page, e.getValue());
+                } else {
+                    for (Ink.Stroke s : e.getValue()) {
+                        page.strokes.add(s);
+                        sendStroke(page, s);
+                    }
                 }
+                listener.onEdited(page);
             }
-            listener.onEdited(page);
+            push(to, new Object[] {add ? "erase" : "add", byPage});
         }
-        push(to, new Object[] {add ? "erase" : "add", byPage});
         renderLayer();
         notifyUndo();
     }

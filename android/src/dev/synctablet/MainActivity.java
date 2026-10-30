@@ -22,7 +22,11 @@ import java.util.ArrayList;
  */
 public final class MainActivity extends Activity implements SyncClient.Listener {
     private AuroraView aurora;
-    private LinearLayout grid;
+    private LinearLayout grid, chips;
+    private EditText search;
+    /** Filtro: "" todos, "★" favoritos, o el nombre de una carpeta. */
+    private String filter = "";
+    private GlassLayout statusPill;
     private TextView status;
     private View statusDot;
     private final ArrayList<GlassLayout> glass = new ArrayList<>();
@@ -73,6 +77,41 @@ public final class MainActivity extends Activity implements SyncClient.Listener 
         pill.addView(wifi);
         header.addView(pill, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, Ui.dp(this, 48)));
         content.addView(header);
+        statusPill = pill;
+
+        // Buscar (títulos y textos de las páginas) y filtrar por favoritos o carpeta.
+        LinearLayout tools = new LinearLayout(this);
+        tools.setGravity(Gravity.CENTER_VERTICAL);
+        GlassLayout field = glass(Ui.dp(this, 22));
+        field.setGravity(Gravity.CENTER_VERTICAL);
+        field.setPadding(Ui.dp(this, 6), 0, Ui.dp(this, 14), 0);
+        IconView lens = new IconView(this, IconView.SEARCH, 0xCCFFFFFF, "Buscar");
+        lens.setClickable(false);
+        field.addView(lens);
+        search = new EditText(this);
+        search.setHint("Buscar en tus cuadernos");
+        search.setHintTextColor(0x99FFFFFF);
+        search.setTextColor(0xFFFFFFFF);
+        search.setBackground(null);
+        search.setSingleLine(true);
+        search.addTextChangedListener(new android.text.TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void afterTextChanged(android.text.Editable s) { fill(); }
+        });
+        field.addView(search, new LinearLayout.LayoutParams(Ui.dp(this, 300), ViewGroup.LayoutParams.WRAP_CONTENT));
+        tools.addView(field, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, Ui.dp(this, 48)));
+        chips = new LinearLayout(this);
+        chips.setGravity(Gravity.CENTER_VERTICAL);
+        android.widget.HorizontalScrollView chipScroll = new android.widget.HorizontalScrollView(this);
+        chipScroll.setHorizontalScrollBarEnabled(false);
+        chipScroll.addView(chips);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        clp.leftMargin = Ui.dp(this, 14);
+        tools.addView(chipScroll, clp);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tlp.topMargin = Ui.dp(this, 20);
+        content.addView(tools, tlp);
 
         grid = new LinearLayout(this);
         grid.setOrientation(LinearLayout.VERTICAL);
@@ -108,15 +147,65 @@ public final class MainActivity extends Activity implements SyncClient.Listener 
     }
 
     /** Rejilla: «Nuevo cuaderno» y un cuaderno por tarjeta. */
+    /** ¿El cuaderno coincide con la búsqueda (título o textos de sus páginas)? */
+    private boolean matches(Ink.Notebook n, String q) {
+        if (q.isEmpty() || n.title.toLowerCase().contains(q)) return true;
+        for (String id : n.pages) {
+            Ink.Page p = store.page(id);
+            if (p == null) continue;
+            for (Ink.Item it : p.items) if (it.text != null && it.text.toLowerCase().contains(q)) return true;
+        }
+        return false;
+    }
+
+    private void fillChips() {
+        chips.removeAllViews();
+        java.util.TreeSet<String> folders = new java.util.TreeSet<>();
+        for (Ink.Notebook n : store.notebooks()) if (!n.folder.isEmpty()) folders.add(n.folder);
+        if (!filter.isEmpty() && !filter.equals("★") && !folders.contains(filter)) filter = "";
+        ArrayList<String> all = new ArrayList<>();
+        all.add("");
+        all.add("★");
+        all.addAll(folders);
+        for (String f : all) {
+            TextView chip = Ui.text(this, f.isEmpty() ? "Todos" : f.equals("★") ? "★ Favoritos" : f, 14, 0xFFFFFFFF, f.equals(filter));
+            chip.setGravity(Gravity.CENTER);
+            chip.setMinHeight(Ui.dp(this, 40));
+            chip.setPadding(Ui.dp(this, 16), 0, Ui.dp(this, 16), 0);
+            android.graphics.drawable.GradientDrawable d = Ui.round(f.equals(filter) ? 0x4DFFFFFF : 0x1AFFFFFF, Ui.dp(this, 20));
+            d.setStroke(Ui.dp(this, 1), 0x40FFFFFF);
+            chip.setBackground(d);
+            chip.setOnClickListener(v -> {
+                filter = f;
+                fill();
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.rightMargin = Ui.dp(this, 8);
+            chips.addView(chip, lp);
+        }
+    }
+
     private void fill() {
-        glass.retainAll(java.util.Collections.singleton(glass.get(0)));
+        // Las tarjetas de cristal se rehacen; la cápsula y el buscador se quedan.
+        glass.removeIf(g -> g != statusPill && g != search.getParent());
+        fillChips();
+        String q = search.getText().toString().trim().toLowerCase();
         grid.removeAllViews();
         int width = grid.getWidth() > 0 ? grid.getWidth() : getResources().getDisplayMetrics().widthPixels;
         int cols = Math.max(2, width / Ui.dp(this, 220));
         int gap = Ui.dp(this, 18);
         ArrayList<View> tiles = new ArrayList<>();
-        tiles.add(newTile());
-        for (Ink.Notebook n : store.notebooks()) tiles.add(tile(n));
+        if (q.isEmpty() && filter.isEmpty()) tiles.add(newTile());
+        for (Ink.Notebook n : store.notebooks()) {
+            if (filter.equals("★") && !n.favorite) continue;
+            if (!filter.isEmpty() && !filter.equals("★") && !filter.equals(n.folder)) continue;
+            if (matches(n, q)) tiles.add(tile(n));
+        }
+        if (tiles.isEmpty()) {
+            TextView none = Ui.text(this, "Nada coincide.", 16, 0xCCFFFFFF, false);
+            grid.addView(none);
+            return;
+        }
         LinearLayout row = null;
         for (int i = 0; i < tiles.size(); i++) {
             if (i % cols == 0) {
@@ -165,8 +254,9 @@ public final class MainActivity extends Activity implements SyncClient.Listener 
         col.setOrientation(LinearLayout.VERTICAL);
         col.setGravity(Gravity.BOTTOM);
         col.setPadding(Ui.dp(this, 16), 0, 0, 0);
-        col.addView(Ui.text(this, n.title, 20, 0xFFFFFFFF, true));
-        col.addView(Ui.text(this, n.pages.size() == 1 ? "1 página" : n.pages.size() + " páginas", 14, 0xCCFFFFFF, false));
+        col.addView(Ui.text(this, (n.favorite ? "★ " : "") + n.title, 20, 0xFFFFFFFF, true));
+        String info = n.pages.size() == 1 ? "1 página" : n.pages.size() + " páginas";
+        col.addView(Ui.text(this, n.folder.isEmpty() ? info : info + " · " + n.folder, 14, 0xCCFFFFFF, false));
         g.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1));
         g.setClickable(true);
         g.setOnClickListener(v -> open(n));
@@ -210,8 +300,13 @@ public final class MainActivity extends Activity implements SyncClient.Listener 
     private void menu(Ink.Notebook n) {
         new AlertDialog.Builder(this)
                 .setTitle(n.title)
-                .setItems(new String[] {"Renombrar", "Cambiar color", "Borrar"}, (d, which) -> {
+                .setItems(new String[] {"Renombrar", "Cambiar color", n.favorite ? "Quitar de favoritos" : "Marcar como favorito",
+                        "Mover a carpeta…", "Borrar"}, (d, which) -> {
                     if (which == 0) rename(n);
+                    else if (which == 2) {
+                        n.favorite = !n.favorite;
+                        changed(n);
+                    } else if (which == 3) moveToFolder(n);
                     else if (which == 1) {
                         int i = 0;
                         while (i < Ui.COVERS.length && Ui.COVERS[i] != n.color) i++;
@@ -235,6 +330,42 @@ public final class MainActivity extends Activity implements SyncClient.Listener 
                     }
                 })
                 .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    private void moveToFolder(Ink.Notebook n) {
+        java.util.TreeSet<String> folders = new java.util.TreeSet<>();
+        for (Ink.Notebook o : store.notebooks()) if (!o.folder.isEmpty()) folders.add(o.folder);
+        ArrayList<String> items = new ArrayList<>(folders);
+        items.add("Nueva carpeta…");
+        items.add("Sin carpeta");
+        new AlertDialog.Builder(this)
+                .setTitle("Mover «" + n.title + "» a")
+                .setItems(items.toArray(new String[0]), (d, which) -> {
+                    String choice = items.get(which);
+                    if (choice.equals("Sin carpeta")) {
+                        n.folder = "";
+                        changed(n);
+                    } else if (choice.equals("Nueva carpeta…")) {
+                        EditText e = field("");
+                        e.setHint("Universidad, Proyectos…");
+                        new AlertDialog.Builder(this)
+                                .setTitle("Carpeta nueva")
+                                .setView(e)
+                                .setPositiveButton("Mover", (d2, w) -> {
+                                    String name = e.getText().toString().trim();
+                                    if (!name.isEmpty()) {
+                                        n.folder = name;
+                                        changed(n);
+                                    }
+                                })
+                                .setNegativeButton("Cancelar", null)
+                                .show();
+                    } else {
+                        n.folder = choice;
+                        changed(n);
+                    }
+                })
                 .show();
     }
 

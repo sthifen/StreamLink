@@ -33,6 +33,7 @@ final class Store {
 
     private final File dir;
     private final File pagesDir;
+    private final File assetsDir;
     private final ExecutorService writer = Executors.newSingleThreadExecutor();
     private final ArrayList<Ink.Notebook> notebooks = new ArrayList<>();
     private final HashMap<String, Ink.Page> pages = new HashMap<>();
@@ -42,6 +43,8 @@ final class Store {
         dir = new File(root, "notes");
         pagesDir = new File(dir, "pages");
         pagesDir.mkdirs();
+        assetsDir = new File(dir, "assets");
+        assetsDir.mkdirs();
         try {
             JSONArray a = new JSONArray(read(new File(dir, "notebooks.json"), "[]"));
             for (int i = 0; i < a.length(); i++) notebooks.add(Ink.Notebook.fromJson(a.getJSONObject(i)));
@@ -53,6 +56,34 @@ final class Store {
         } catch (JSONException e) {
             android.util.Log.e("SyncTablet", "índice ilegible", e);
         }
+    }
+
+    File assetFile(String id) {
+        return new File(assetsDir, id + ".jpg");
+    }
+
+    /** Guarda una imagen como JPEG y devuelve su id. */
+    String putAsset(android.graphics.Bitmap b) throws IOException {
+        String id = Ink.newId();
+        File f = assetFile(id), tmp = new File(f.getPath() + ".tmp");
+        try (FileOutputStream out = new FileOutputStream(tmp)) {
+            b.compress(android.graphics.Bitmap.CompressFormat.JPEG, 88, out);
+        }
+        if (!tmp.renameTo(f)) throw new IOException("no se pudo guardar la imagen");
+        return id;
+    }
+
+    /** Página nueva al final, copia de otra (sus trazos e imágenes). */
+    synchronized Ink.Page duplicatePage(Ink.Notebook n, Ink.Page from, int at) {
+        Ink.Page p = new Ink.Page(Ink.newId(), n.id);
+        p.copyFrom(from);
+        // Las imágenes y textos se pueden mover: cada página con los suyos.
+        for (int i = 0; i < p.items.size(); i++) p.items.set(i, p.items.get(i).copy(p.items.get(i).id));
+        n.pages.add(at, p.id);
+        pages.put(p.id, p);
+        savePage(p);
+        saveNotebooks();
+        return p;
     }
 
     synchronized ArrayList<Ink.Notebook> notebooks() {

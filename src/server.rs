@@ -34,6 +34,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/notebooks", get(notebooks))
         .route("/api/page/{id}", get(page_json))
         .route("/api/page/{id}/svg", get(page_svg))
+        .route("/api/asset/{file}", get(asset))
         .route("/ws/ink", get(ws_ink))
         .route("/ws/live", get(ws_live))
         .with_state(state)
@@ -56,8 +57,18 @@ async fn page_json(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> Re
 
 async fn page_svg(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match s.store.lock().unwrap().page(&id) {
-        Some(p) => ([(header::CONTENT_TYPE, "image/svg+xml")], crate::svg::page_svg(p)).into_response(),
+        Some(p) => ([(header::CONTENT_TYPE, "image/svg+xml")], crate::svg::page_svg(p, "/api/asset/")).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn asset(State(s): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
+    let id = file.strip_suffix(".jpg").unwrap_or(&file);
+    let path = s.store.lock().unwrap().asset_path(id);
+    match path.map(std::fs::read) {
+        Some(Ok(bytes)) => ([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "max-age=31536000, immutable")], bytes)
+            .into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -117,8 +128,10 @@ async fn tablet(mut socket: WebSocket, s: Arc<AppState>, peer: SocketAddr) {
             let _ = s.live.send(json!({ "t": "device", "name": device, "connected": true }).to_string());
         }
         if let Some(r) = reply {
-            if socket.send(Message::Text(r.into())).await.is_err() {
-                break;
+            for line in r.lines() {
+                if socket.send(Message::Text(line.to_owned().into())).await.is_err() {
+                    return;
+                }
             }
         }
     }
@@ -147,7 +160,21 @@ fn handle(s: &AppState, msg: &Msg, raw: &str) -> anyhow::Result<Option<String>> 
             let mut missing: Vec<&str> =
                 pages.iter().filter(|(id, v)| have.get(*id).is_none_or(|h| h < v)).map(|(id, _)| id.as_str()).collect();
             missing.sort();
-            return Ok(want(missing));
+            // Imágenes que no llegaron (una subida cortada, un PC nuevo…).
+            let mut assets: Vec<String> = Vec::new();
+            for id in have.keys() {
+                if let Some(p) = store.page(id) {
+                    assets.extend(store.missing_assets(p));
+                }
+            }
+            assets.sort();
+            assets.dedup();
+            let mut out = want(missing).unwrap();
+            if !assets.is_empty() {
+                out.push('\n');
+                out.push_str(&json!({ "t": "want_assets", "ids": assets }).to_string());
+            }
+            return Ok(Some(out));
         }
         Msg::Notebook { notebook } => {
             store.put_notebook(notebook.clone())?;
@@ -155,10 +182,25 @@ fn handle(s: &AppState, msg: &Msg, raw: &str) -> anyhow::Result<Option<String>> 
         }
         Msg::Page { page } => {
             store.put_page(page.clone())?;
+            let missing = store.missing_assets(page);
+            if !missing.is_empty() {
+                let _ = s.live.send(raw.to_owned());
+                return Ok(Some(json!({ "t": "want_assets", "ids": missing }).to_string()));
+            }
             Applied::Ok
+        }
+        Msg::Asset { id, data, .. } => {
+            store.put_asset(id, data)?;
+            // Al visor sólo el aviso, no la imagen entera.
+            let _ = s.live.send(json!({ "t": "asset", "id": id }).to_string());
+            return Ok(None);
         }
         Msg::Stroke { page, version, stroke } => store.add_stroke(page, *version, stroke.clone())?,
         Msg::Erase { page, version, ids } => store.erase(page, *version, ids)?,
+        Msg::Laser { .. } => {
+            let _ = s.live.send(raw.to_owned());
+            return Ok(None);
+        }
         Msg::DeletePage { page } => {
             store.delete_page(page)?;
             Applied::Ok

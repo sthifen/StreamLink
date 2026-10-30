@@ -15,8 +15,10 @@ import org.json.JSONObject;
  */
 final class Ink {
     static final float W = 1000f, H = 1414f;
-    static final String PEN = "pen", HIGHLIGHTER = "highlighter";
-    static final String PLAIN = "plain", LINES = "lines", GRID = "grid";
+    static final String PEN = "pen", PENCIL = "pencil", BRUSH = "brush", CALLIGRAPHY = "calligraphy",
+            HIGHLIGHTER = "highlighter", TAPE = "tape";
+    static final String PLAIN = "plain", LINES = "lines", GRID = "grid", DOTS = "dots", CORNELL = "cornell",
+            MUSIC = "music", TODO = "todo";
 
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final char[] ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789".toCharArray();
@@ -44,6 +46,80 @@ final class Ink {
         return width * (0.35f + 0.65f * Math.max(0f, Math.min(1f, p)));
     }
 
+    /**
+     * Grosor de un tramo según el lápiz, la presión y la dirección (dx, dy);
+     * las mismas fórmulas que el PC (svg.rs) y el visor web.
+     */
+    static float segWidth(String tool, float w, float p, float dx, float dy) {
+        p = Math.max(0f, Math.min(1f, p));
+        switch (tool) {
+            case PENCIL: return w * 0.7f * (0.5f + 0.5f * p);
+            case BRUSH: return w * (0.1f + 1.7f * p);
+            case CALLIGRAPHY:
+                double a = Math.atan2(dy, dx) - Math.PI / 4;
+                return w * (0.25f + 0.95f * (float) Math.abs(Math.sin(a))) * (0.6f + 0.4f * p);
+            case HIGHLIGHTER: case TAPE: return w;
+            default: return pressureWidth(w, p);
+        }
+    }
+
+    /** Opacidad (0–255) de un tramo: el lápiz es más claro si se aprieta poco. */
+    static int segAlpha(String tool, float p) {
+        if (!PENCIL.equals(tool)) return 255;
+        return Math.round(255 * 0.75f * (0.4f + 0.6f * Math.max(0f, Math.min(1f, p))));
+    }
+
+    /** Imagen o cuadro de texto sobre la hoja. */
+    static final class Item {
+        final String id;
+        final String kind;
+        String asset, text;
+        float x, y, w, h, size = 28;
+        int color = 0xFF111827;
+
+        Item(String id, String kind) {
+            this.id = id;
+            this.kind = kind;
+        }
+
+        boolean isImage() { return "image".equals(kind); }
+
+        Item copy(String newId) {
+            Item c = new Item(newId, kind);
+            c.asset = asset; c.text = text; c.x = x; c.y = y; c.w = w; c.h = h; c.size = size; c.color = color;
+            return c;
+        }
+
+        JSONObject toJsonObject() throws JSONException {
+            JSONObject o = new JSONObject();
+            o.put("id", id);
+            o.put("kind", kind);
+            o.put("x", x);
+            o.put("y", y);
+            o.put("w", w);
+            if (isImage()) {
+                o.put("asset", asset);
+                o.put("h", h);
+            } else {
+                o.put("text", text == null ? "" : text);
+                o.put("size", size);
+                o.put("color", hex(color));
+            }
+            return o;
+        }
+
+        static Item fromJson(JSONObject o) throws JSONException {
+            Item i = new Item(o.getString("id"), o.optString("kind", "text"));
+            i.asset = o.optString("asset", null);
+            i.text = o.optString("text", "");
+            i.x = (float) o.optDouble("x"); i.y = (float) o.optDouble("y");
+            i.w = (float) o.optDouble("w", 300); i.h = (float) o.optDouble("h", 200);
+            i.size = (float) o.optDouble("size", 28);
+            i.color = parseColor(o.optString("color", "#111827"), 0xFF111827);
+            return i;
+        }
+    }
+
     static final class Stroke {
         final String id;
         final String tool;
@@ -53,6 +129,20 @@ final class Ink {
         int n;
         /** Caja que lo contiene, para la goma. */
         float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE, maxX = -Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
+
+        /** Copia con otro id y/o color (para duplicar y recolorear). */
+        Stroke copy(String newId, int newColor) {
+            Stroke s = new Stroke(newId, tool, newColor, width);
+            for (int i = 0; i < n; i++) s.add(x(i), y(i), p(i));
+            return s;
+        }
+
+        /** Copia movida y escalada: (x, y) → (ax + (x − ax)·k + dx, …). */
+        Stroke transformed(float ax, float ay, float k, float dx, float dy) {
+            Stroke s = new Stroke(id, tool, color, width * k);
+            for (int i = 0; i < n; i++) s.add(ax + (x(i) - ax) * k + dx, ay + (y(i) - ay) * k + dy, p(i));
+            return s;
+        }
 
         Stroke(String id, String tool, int color, float width) {
             this.id = id;
@@ -123,7 +213,20 @@ final class Ink {
         final String notebook;
         long version;
         String background = LINES;
+        /** Página de un PDF importado como fondo (id de la imagen). */
+        String bgAsset;
         final ArrayList<Stroke> strokes = new ArrayList<>();
+        final ArrayList<Item> items = new ArrayList<>();
+
+        /** Toma el contenido de otra (para deshacer volviendo a una copia). */
+        void copyFrom(Page o) {
+            background = o.background;
+            bgAsset = o.bgAsset;
+            strokes.clear();
+            strokes.addAll(o.strokes);
+            items.clear();
+            items.addAll(o.items);
+        }
 
         Page(String id, String notebook) {
             this.id = id;
@@ -139,7 +242,17 @@ final class Ink {
                 if (i > 0) b.append(',');
                 b.append(strokes.get(i).toJson());
             }
-            return b.append("]}").toString();
+            b.append("],\"items\":[");
+            for (int i = 0; i < items.size(); i++) {
+                if (i > 0) b.append(',');
+                try {
+                    b.append(items.get(i).toJsonObject());
+                } catch (JSONException ignored) {
+                }
+            }
+            b.append(']');
+            if (bgAsset != null) b.append(",\"bg_asset\":\"").append(bgAsset).append('"');
+            return b.append('}').toString();
         }
 
         static Page fromJson(String json) throws JSONException {
@@ -149,6 +262,9 @@ final class Ink {
             p.background = o.optString("background", LINES);
             JSONArray s = o.optJSONArray("strokes");
             if (s != null) for (int i = 0; i < s.length(); i++) p.strokes.add(Stroke.fromJson(s.getJSONObject(i)));
+            JSONArray it = o.optJSONArray("items");
+            if (it != null) for (int i = 0; i < it.length(); i++) p.items.add(Item.fromJson(it.getJSONObject(i)));
+            if (o.has("bg_asset") && !o.isNull("bg_asset")) p.bgAsset = o.getString("bg_asset");
             return p;
         }
     }
@@ -157,6 +273,8 @@ final class Ink {
         final String id;
         String title;
         int color;
+        String folder = "";
+        boolean favorite;
         final ArrayList<String> pages = new ArrayList<>();
 
         Notebook(String id, String title, int color) {
@@ -171,6 +289,8 @@ final class Ink {
             o.put("title", title);
             o.put("color", hex(color));
             o.put("pages", new JSONArray(pages));
+            o.put("folder", folder);
+            o.put("favorite", favorite);
             return o;
         }
 
@@ -179,6 +299,8 @@ final class Ink {
                     parseColor(o.optString("color", "#2DD4BF"), 0xFF2DD4BF));
             JSONArray p = o.optJSONArray("pages");
             if (p != null) for (int i = 0; i < p.length(); i++) n.pages.add(p.getString(i));
+            n.folder = o.optString("folder", "");
+            n.favorite = o.optBoolean("favorite");
             return n;
         }
     }

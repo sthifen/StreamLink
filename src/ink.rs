@@ -21,6 +21,11 @@ pub struct Notebook {
     /// Páginas en orden.
     #[serde(default)]
     pub pages: Vec<String>,
+    /// Carpeta en la portada de la tablet ("" = ninguna).
+    #[serde(default)]
+    pub folder: String,
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 fn default_cover() -> String {
@@ -34,6 +39,13 @@ pub enum Background {
     Plain,
     Lines,
     Grid,
+    Dots,
+    /// Método Cornell: columna de ideas a la izquierda y resumen abajo.
+    Cornell,
+    /// Pentagramas.
+    Music,
+    /// Lista de tareas con casillas.
+    Todo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -41,7 +53,13 @@ pub enum Background {
 pub enum Tool {
     #[default]
     Pen,
+    Pencil,
+    Brush,
+    /// Pluma de caligrafía: el grosor depende de la dirección del trazo.
+    Calligraphy,
     Highlighter,
+    /// Cinta para tapar (respuestas, apuntes): en la tablet se destapa con un toque.
+    Tape,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -77,6 +95,48 @@ pub struct Page {
     pub background: Background,
     #[serde(default)]
     pub strokes: Vec<Stroke>,
+    /// Imágenes y cuadros de texto.
+    #[serde(default)]
+    pub items: Vec<Item>,
+    /// Imagen de fondo de toda la hoja (una página de un PDF importado).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_asset: Option<String>,
+}
+
+/// Un elemento de la hoja que no es un trazo.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Item {
+    Image { id: String, asset: String, x: f32, y: f32, w: f32, h: f32 },
+    Text {
+        id: String,
+        text: String,
+        x: f32,
+        y: f32,
+        w: f32,
+        #[serde(default = "default_text_size")]
+        size: f32,
+        #[serde(default = "default_text_color")]
+        color: String,
+    },
+}
+
+fn default_text_size() -> f32 {
+    28.0
+}
+
+fn default_text_color() -> String {
+    "#111827".into()
+}
+
+impl Page {
+    /// Imágenes de las que hace falta el archivo.
+    pub fn assets(&self) -> impl Iterator<Item = &str> {
+        self.bg_asset.as_deref().into_iter().chain(self.items.iter().filter_map(|i| match i {
+            Item::Image { asset, .. } => Some(asset.as_str()),
+            Item::Text { .. } => None,
+        }))
+    }
 }
 
 /// Lo que llega de la tablet por `/ws/ink`.
@@ -94,8 +154,12 @@ pub enum Msg {
     /// Página completa (al sincronizar o al cambiar el fondo).
     Page { page: Page },
     Stroke { page: String, version: u64, stroke: Stroke },
+    /// Archivo de una imagen (JPEG/PNG en base64), antes de usarla en una página.
+    Asset { id: String, mime: String, data: String },
     Erase { page: String, version: u64, ids: Vec<String> },
     DeletePage { page: String },
+    /// Puntero láser (no se guarda): sólo para el visor en vivo.
+    Laser { page: String, points: Vec<f32> },
     DeleteNotebook { notebook: String },
 }
 
@@ -149,7 +213,7 @@ mod tests {
     }
 
     fn page() -> Page {
-        Page { id: "p".into(), notebook: "n".into(), version: 0, background: Background::Plain, strokes: vec![] }
+        Page { id: "p".into(), notebook: "n".into(), version: 0, background: Background::Plain, strokes: vec![], items: vec![], bg_asset: None }
     }
 
     #[test]

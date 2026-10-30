@@ -3,6 +3,7 @@
 //! ```text
 //! .data/notebooks.json        cuadernos (orden de páginas incluido)
 //! .data/pages/<id>.json       cada página con sus trazos: la fuente de verdad
+//! .data/assets/<id>.jpg       imágenes y páginas de PDF
 //! <Cuaderno>/Página 01.svg    copia para abrir en cualquier programa
 //! ```
 //!
@@ -55,6 +56,7 @@ impl Store {
     pub fn open(root: &Path) -> Result<Self> {
         let data = root.join(".data");
         fs::create_dir_all(data.join("pages")).with_context(|| format!("no se pudo crear {}", data.display()))?;
+        fs::create_dir_all(data.join("assets"))?;
         let notebooks: Vec<Notebook> = fs::read(data.join("notebooks.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -77,6 +79,33 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn asset_path(&self, id: &str) -> Option<PathBuf> {
+        valid_id(id).then(|| self.root.join(format!(".data/assets/{id}.jpg")))
+    }
+
+    pub fn has_asset(&self, id: &str) -> bool {
+        self.asset_path(id).is_some_and(|p| p.is_file())
+    }
+
+    /// Guarda una imagen (base64) que manda la tablet.
+    pub fn put_asset(&mut self, id: &str, data: &str) -> Result<()> {
+        use base64::Engine;
+        let Some(path) = self.asset_path(id) else { bail!("imagen con id inválido") };
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).context("imagen mal codificada")?;
+        write_atomic(&path, &bytes)?;
+        // Las páginas que la usan ya pueden exportarse con ella.
+        let users: Vec<Page> = self.pages.values().filter(|p| p.assets().any(|a| a == id)).cloned().collect();
+        for p in &users {
+            self.export_page(p)?;
+        }
+        Ok(())
+    }
+
+    /// Imágenes que usan las páginas y aún no están en el PC.
+    pub fn missing_assets(&self, page: &Page) -> Vec<String> {
+        page.assets().filter(|a| !self.has_asset(a)).map(str::to_owned).collect()
     }
 
     pub fn notebooks(&self) -> &[Notebook] {
@@ -107,7 +136,7 @@ impl Store {
         let Some(i) = nb.pages.iter().position(|p| *p == page.id) else { return Ok(()) };
         let dir = self.root.join(folder_name(&nb.title));
         fs::create_dir_all(&dir)?;
-        write_atomic(&dir.join(format!("Página {:02}.svg", i + 1)), page_svg(page).as_bytes())
+        write_atomic(&dir.join(format!("Página {:02}.svg", i + 1)), page_svg(page, "../.data/assets/").as_bytes())
     }
 
     /// Rehace los SVG de un cuaderno (páginas nuevas, quitadas o reordenadas).
@@ -221,11 +250,11 @@ mod tests {
     }
 
     fn nb(title: &str, pages: &[&str]) -> Notebook {
-        Notebook { id: "nb1".into(), title: title.into(), color: "#000000".into(), pages: pages.iter().map(|s| s.to_string()).collect() }
+        Notebook { id: "nb1".into(), title: title.into(), color: "#000000".into(), pages: pages.iter().map(|s| s.to_string()).collect(), folder: String::new(), favorite: false }
     }
 
     fn page(id: &str) -> Page {
-        Page { id: id.into(), notebook: "nb1".into(), version: 0, background: Background::Lines, strokes: vec![] }
+        Page { id: id.into(), notebook: "nb1".into(), version: 0, background: Background::Lines, strokes: vec![], items: vec![], bg_asset: None }
     }
 
     fn stroke() -> Stroke {

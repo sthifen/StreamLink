@@ -99,6 +99,21 @@ final class SyncClient {
         send("{\"t\":\"page\",\"page\":" + p.toJson() + "}");
     }
 
+    /** Manda una imagen (en un hilo: leerla y codificarla tarda). */
+    void sendAsset(String id) {
+        if (!connected) return;
+        new Thread(() -> {
+            try {
+                java.io.File f = Store.get(app).assetFile(id);
+                byte[] bytes = java.nio.file.Files.readAllBytes(f.toPath());
+                String data = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP);
+                send("{\"t\":\"asset\",\"id\":\"" + id + "\",\"mime\":\"image/jpeg\",\"data\":\"" + data + "\"}");
+            } catch (IOException e) {
+                android.util.Log.w("SyncTablet", "no se pudo mandar la imagen " + id, e);
+            }
+        }, "sync-asset").start();
+    }
+
     private void start() {
         Thread t = new Thread(this::loop, "sync");
         t.setDaemon(true);
@@ -148,7 +163,10 @@ final class SyncClient {
                 WebSocketClient.Message msg = ws.read();
                 if (msg.opcode != WebSocketClient.TEXT) continue;
                 JSONObject m = new JSONObject(msg.text());
-                if ("want".equals(m.optString("t"))) {
+                if ("want_assets".equals(m.optString("t"))) {
+                    JSONArray ids = m.getJSONArray("ids");
+                    for (int i = 0; i < ids.length(); i++) sendAsset(ids.getString(i));
+                } else if ("want".equals(m.optString("t"))) {
                     JSONArray ids = m.getJSONArray("pages");
                     final ArrayList<String> list = new ArrayList<>();
                     for (int i = 0; i < ids.length(); i++) list.add(ids.getString(i));

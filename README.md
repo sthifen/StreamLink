@@ -18,6 +18,16 @@
   El **lápiz escribe** (con presión) y **el dedo mueve la hoja y hace zoom**, así la
   palma no pinta. Pluma, resaltador, goma (también con la punta de goma o el botón
   del S Pen), deshacer y rehacer. Funciona sin el PC.
+- **Herramientas como en Samsung Notes:** pluma, lápiz, pincel y caligrafía; resaltador;
+  goma de trazo o parcial; **lazo** (mover, cambiar tamaño, recolorear, duplicar,
+  borrar); texto; cinta para tapar respuestas (un toque la destapa); puntero láser
+  (también se ve en el PC); colores a medida.
+- **Hojas:** rayas, cuadros, puntos, Cornell, lista de tareas, pentagrama o lisa;
+  páginas continuas (tira hacia arriba al final para una nueva); miniaturas para
+  ordenar, duplicar y borrar.
+- **Fotos y PDF:** inserta fotos y muévelas con el lazo; importa un PDF y escribe
+  encima; exporta el cuaderno a PDF.
+- **Portada:** carpetas, favoritos y búsqueda (títulos y textos de las páginas).
 - **Figuras perfectas:** al terminar un trazo, deja el lápiz quieto medio segundo y se
   convierte en línea, círculo, elipse, rectángulo o triángulo. Con el botón de figuras
   activado se convierte cualquier trazo que lo parezca.
