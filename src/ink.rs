@@ -1,0 +1,190 @@
+//! Modelo de los apuntes: cuadernos, páginas y trazos, y las operaciones que
+//! manda la tablet. El mismo formato JSON que `android/.../Ink.java`.
+//!
+//! La tablet es la dueña de los datos: cada cambio sube la versión de la
+//! página en uno, y el PC sólo aplica una operación si viene justo detrás
+//! de la versión que tiene. Si se saltó alguna, pide la página entera.
+
+use serde::{Deserialize, Serialize};
+
+/// Medidas lógicas de una página (proporción A4).
+pub const PAGE_W: f32 = 1000.0;
+pub const PAGE_H: f32 = 1414.0;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Notebook {
+    pub id: String,
+    pub title: String,
+    /// Color de la tapa, `#RRGGBB`.
+    #[serde(default = "default_cover")]
+    pub color: String,
+    /// Páginas en orden.
+    #[serde(default)]
+    pub pages: Vec<String>,
+}
+
+fn default_cover() -> String {
+    "#2DD4BF".into()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Background {
+    #[default]
+    Plain,
+    Lines,
+    Grid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Tool {
+    #[default]
+    Pen,
+    Highlighter,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Stroke {
+    pub id: String,
+    #[serde(default)]
+    pub tool: Tool,
+    pub color: String,
+    /// Grosor con presión 1, en unidades de página.
+    pub width: f32,
+    /// x, y, presión (0–1), seguidos.
+    pub points: Vec<f32>,
+}
+
+impl Stroke {
+    pub fn point_count(&self) -> usize {
+        self.points.len() / 3
+    }
+
+    /// (x, y, presión) del punto `i`.
+    pub fn point(&self, i: usize) -> (f32, f32, f32) {
+        (self.points[3 * i], self.points[3 * i + 1], self.points[3 * i + 2])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Page {
+    pub id: String,
+    pub notebook: String,
+    #[serde(default)]
+    pub version: u64,
+    #[serde(default)]
+    pub background: Background,
+    #[serde(default)]
+    pub strokes: Vec<Stroke>,
+}
+
+/// Lo que llega de la tablet por `/ws/ink`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum Msg {
+    /// Al conectar: versión de cada página que tiene la tablet.
+    Hello {
+        #[serde(default)]
+        device: String,
+        #[serde(default)]
+        pages: std::collections::HashMap<String, u64>,
+    },
+    Notebook { notebook: Notebook },
+    /// Página completa (al sincronizar o al cambiar el fondo).
+    Page { page: Page },
+    Stroke { page: String, version: u64, stroke: Stroke },
+    Erase { page: String, version: u64, ids: Vec<String> },
+    DeletePage { page: String },
+    DeleteNotebook { notebook: String },
+}
+
+/// Qué pasó al aplicar una operación a una página.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Applied {
+    Ok,
+    /// Ya la tenía (llegó repetida).
+    Stale,
+    /// Falta alguna anterior: hay que pedir la página entera.
+    Gap,
+}
+
+impl Page {
+    fn step(&mut self, version: u64) -> Option<Applied> {
+        if version <= self.version {
+            Some(Applied::Stale)
+        } else if version > self.version + 1 {
+            Some(Applied::Gap)
+        } else {
+            self.version = version;
+            None
+        }
+    }
+
+    pub fn add_stroke(&mut self, version: u64, stroke: Stroke) -> Applied {
+        if let Some(r) = self.step(version) {
+            return r;
+        }
+        // Al rehacer, la tablet vuelve a mandar un trazo borrado con su id.
+        self.strokes.retain(|s| s.id != stroke.id);
+        self.strokes.push(stroke);
+        Applied::Ok
+    }
+
+    pub fn erase(&mut self, version: u64, ids: &[String]) -> Applied {
+        if let Some(r) = self.step(version) {
+            return r;
+        }
+        self.strokes.retain(|s| !ids.contains(&s.id));
+        Applied::Ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stroke(id: &str) -> Stroke {
+        Stroke { id: id.into(), tool: Tool::Pen, color: "#000000".into(), width: 3.0, points: vec![0.0, 0.0, 0.5, 10.0, 10.0, 1.0] }
+    }
+
+    fn page() -> Page {
+        Page { id: "p".into(), notebook: "n".into(), version: 0, background: Background::Plain, strokes: vec![] }
+    }
+
+    #[test]
+    fn applies_operations_in_order() {
+        let mut p = page();
+        assert_eq!(p.add_stroke(1, stroke("a")), Applied::Ok);
+        assert_eq!(p.add_stroke(2, stroke("b")), Applied::Ok);
+        assert_eq!(p.erase(3, &["a".into()]), Applied::Ok);
+        assert_eq!(p.strokes.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["b"]);
+        assert_eq!(p.version, 3);
+        // Rehacer el borrado: vuelve el mismo trazo, sin duplicarse.
+        assert_eq!(p.add_stroke(4, stroke("a")), Applied::Ok);
+        assert_eq!(p.add_stroke(5, stroke("a")), Applied::Ok);
+        assert_eq!(p.strokes.len(), 2);
+    }
+
+    #[test]
+    fn detects_repeats_and_gaps() {
+        let mut p = page();
+        p.add_stroke(1, stroke("a"));
+        assert_eq!(p.add_stroke(1, stroke("x")), Applied::Stale);
+        assert_eq!(p.add_stroke(3, stroke("y")), Applied::Gap);
+        assert_eq!(p.version, 1);
+        assert_eq!(p.strokes.len(), 1);
+    }
+
+    #[test]
+    fn reads_tablet_messages() {
+        let m: Msg = serde_json::from_str(
+            r##"{"t":"stroke","page":"p1","version":7,"stroke":{"id":"s1","tool":"highlighter","color":"#ffd60a","width":12,"points":[1,2,0.5]}}"##,
+        )
+        .unwrap();
+        let Msg::Stroke { page, version, stroke } = m else { panic!() };
+        assert_eq!((page.as_str(), version, stroke.tool, stroke.point_count()), ("p1", 7, Tool::Highlighter, 1));
+        let m: Msg = serde_json::from_str(r#"{"t":"hello","device":"S8+","pages":{"a":3}}"#).unwrap();
+        assert!(matches!(m, Msg::Hello { pages, .. } if pages["a"] == 3));
+    }
+}

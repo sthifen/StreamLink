@@ -1,0 +1,5 @@
+target/
+android/build/
+android/*.apk
+android/*.idsig
+dist/
