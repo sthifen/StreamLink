@@ -119,6 +119,21 @@ pub enum Item {
         #[serde(default = "default_text_color")]
         color: String,
     },
+    /// Hoja de cálculo: `cells` lo escrito (fórmulas incluidas), `values` lo
+    /// que se ve (calculado en la tablet), por filas.
+    Table {
+        id: String,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        rows: usize,
+        cols: usize,
+        #[serde(default)]
+        cells: Vec<String>,
+        #[serde(default)]
+        values: Vec<String>,
+    },
 }
 
 fn default_text_size() -> f32 {
@@ -134,7 +149,7 @@ impl Page {
     pub fn assets(&self) -> impl Iterator<Item = &str> {
         self.bg_asset.as_deref().into_iter().chain(self.items.iter().filter_map(|i| match i {
             Item::Image { asset, .. } => Some(asset.as_str()),
-            Item::Text { .. } => None,
+            Item::Text { .. } | Item::Table { .. } => None,
         }))
     }
 }

@@ -169,6 +169,34 @@ fn item_svg(s: &mut String, item: &Item, assets: &str) {
             );
         }
         Item::Image { .. } => {}
+        Item::Table { x, y, w, h, rows, cols, values, .. } => {
+            let (rows, cols) = ((*rows).clamp(1, 200), (*cols).clamp(1, 50));
+            let (cw, ch) = (w / cols as f32, h / rows as f32);
+            let _ = write!(s, r##"<g><rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{:.1}" fill="#F1F5F9" stroke="none"/>"##, ch);
+            s.push_str(r##"<g stroke="#94A3B8" stroke-width="1.2">"##);
+            for r in 0..=rows {
+                line(s, *x, y + r as f32 * ch, x + w, y + r as f32 * ch);
+            }
+            for c in 0..=cols {
+                line(s, x + c as f32 * cw, *y, x + c as f32 * cw, y + h);
+            }
+            s.push_str("</g>");
+            let size = (ch * 0.5).clamp(10.0, 32.0);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let Some(v) = values.get(r * cols + c).filter(|v| !v.is_empty()) else { continue };
+                    let weight = if r == 0 { r#" font-weight="bold""# } else { "" };
+                    let _ = write!(
+                        s,
+                        r##"<text x="{:.1}" y="{:.1}" font-size="{size:.1}" font-family="sans-serif" fill="#111827"{weight}>{}</text>"##,
+                        x + c as f32 * cw + 6.0,
+                        y + r as f32 * ch + ch * 0.68,
+                        escape(&v.chars().take(((cw - 8.0) / (size * 0.55)).max(1.0) as usize).collect::<String>())
+                    );
+                }
+            }
+            s.push_str("</g>");
+        }
         Item::Text { text, x, y, w, size, color: col, .. } => {
             let _ = write!(
                 s,
@@ -309,6 +337,11 @@ mod tests {
         assert!(!svg.contains("<line"));
         p.items.push(Item::Image { id: "x".into(), asset: "../../etc".into(), x: 0.0, y: 0.0, w: 1.0, h: 1.0 });
         assert!(!page_svg(&p, "").contains("etc"));
+        p.items.push(Item::Table { id: "tb".into(), x: 100.0, y: 900.0, w: 400.0, h: 120.0, rows: 2, cols: 2,
+            cells: vec!["Total".into(), "".into(), "=1+2".into(), "".into()], values: vec!["Total".into(), "".into(), "3".into(), "".into()] });
+        let svg = page_svg(&p, "");
+        assert!(svg.contains(r#"font-weight="bold">Total</text>"#));
+        assert!(svg.contains(">3</text>") && !svg.contains("=1+2"));
     }
 
     #[test]

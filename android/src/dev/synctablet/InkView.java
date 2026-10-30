@@ -60,7 +60,16 @@ final class InkView extends View {
         void onSelection(boolean active);
         /** Con la herramienta de texto: crear (item null) o editar un cuadro. */
         void onTextRequest(int page, Ink.Item item, float x, float y);
+        /** Con la herramienta de texto sobre una hoja de cálculo: editarla. */
+        void onTableRequest(int page, Ink.Item table);
+        /** Botón del S Pen pulsado sin tocar la pantalla (doble: dos seguidos). */
+        void onPenButton(boolean twice);
     }
+
+    /** Modos de la goma. */
+    static final int ERASE_STROKES = 0, ERASE_PARTIAL = 1, ERASE_HIGHLIGHTER = 2, ERASE_LASSO = 3;
+    /** Qué hace mantener el botón del S Pen mientras se escribe. */
+    static final int HOLD_ERASE = 0, HOLD_LASSO = 1, HOLD_HIGHLIGHTER = 2, HOLD_NOTHING = 3;
 
     private static final int DESK = 0xFFDDE2E8;
     private static final float MARGIN_DP = 24;
@@ -76,8 +85,8 @@ final class InkView extends View {
     float penWidth = 3f;
     int highlighterColor = 0xFFFFD60A;
     float highlighterWidth = 24f;
-    /** Goma parcial: borra sólo lo que toca, no el trazo entero. */
-    boolean partialEraser;
+    int eraseMode = ERASE_STROKES;
+    int buttonHold = HOLD_ERASE;
     boolean fingerDraws;
     /** Convertir cada trazo en figura si lo parece (sin tener que esperar). */
     boolean autoShapes;
@@ -125,6 +134,8 @@ final class InkView extends View {
 
     // Lazo y selección (en coordenadas de la página selPage).
     private final ArrayList<Float> lasso = new ArrayList<>();
+    /** El lazo es de la goma: borra lo que rodea. */
+    private boolean lassoErases;
     private int selPage = -1;
     private final ArrayList<Ink.Stroke> selStrokes = new ArrayList<>();
     private final ArrayList<Ink.Item> selItems = new ArrayList<>();
@@ -303,6 +314,114 @@ final class InkView extends View {
         updateSelBox();
         listener.onSelection(true);
         invalidate();
+    }
+
+    /** Centro (en la página que se ve) para colocar algo nuevo de alto h. */
+    private float visibleCenterY(int index, float h) {
+        float viewY = (getHeight() / 2f - oy) / scale - pageTop(index);
+        return Math.max(40, Math.min(Ink.H - h - 40, viewY - h / 2));
+    }
+
+    /** Deja seleccionado lo recién insertado, para moverlo o cambiarle el tamaño. */
+    private void selectInserted(int index, List<Ink.Stroke> strokes, List<Ink.Item> items) {
+        clearSelection();
+        selPage = index;
+        selStrokes.addAll(strokes);
+        selItems.addAll(items);
+        updateSelBox();
+        listener.onSelection(true);
+        invalidate();
+    }
+
+    /** Inserta una figura de la galería con la pluma actual, centrada y seleccionada. */
+    void insertShape(ShapeLibrary.Shape shape) {
+        Ink.Page page = visiblePage();
+        if (page == null) return;
+        int index = visible;
+        String old = page.toJson();
+        float w = shape.aspect >= 1 ? 420 : 420 * shape.aspect, h = w / shape.aspect;
+        float x0 = (Ink.W - w) / 2, y0 = visibleCenterY(index, h);
+        ArrayList<Ink.Stroke> made = new ArrayList<>();
+        for (int pass = 0; pass < 2; pass++) {
+            for (float[] line : pass == 0 ? shape.faint : shape.lines) {
+                boolean faint = pass == 0;
+                Ink.Stroke s = new Ink.Stroke(Ink.newId(), Ink.PEN, faint ? 0xFF94A3B8 : penColor, faint ? Math.max(1.2f, penWidth * 0.5f) : penWidth);
+                for (int i = 0; i + 1 < line.length; i += 2) s.add(x0 + line[i] * w, y0 + line[i + 1] * h, 0.7f);
+                made.add(s);
+            }
+        }
+        page.strokes.addAll(made);
+        commitSnapshot(page, old);
+        selectInserted(index, made, new ArrayList<>());
+    }
+
+    /** Hoja de cálculo nueva en la página que se ve. */
+    void insertTable(int rows, int cols) {
+        Ink.Page page = visiblePage();
+        if (page == null) return;
+        int index = visible;
+        String old = page.toJson();
+        Ink.Item t = new Ink.Item(Ink.newId(), "table");
+        t.rows = rows;
+        t.cols = cols;
+        t.cells = new String[rows * cols];
+        java.util.Arrays.fill(t.cells, "");
+        t.evaluate();
+        t.w = Math.min(Ink.W - 80, cols * 170);
+        t.h = rows * 56;
+        t.x = (Ink.W - t.w) / 2;
+        t.y = visibleCenterY(index, t.h);
+        page.items.add(t);
+        commitSnapshot(page, old);
+        ArrayList<Ink.Item> one = new ArrayList<>();
+        one.add(t);
+        selectInserted(index, new ArrayList<>(), one);
+    }
+
+    /** Cambia las celdas (y el tamaño) de una hoja de cálculo. */
+    void putTable(int index, Ink.Item t, String[] cells, int rows, int cols) {
+        if (index < 0 || index >= pages.size()) return;
+        Ink.Page page = pages.get(index);
+        String old = page.toJson();
+        float cellH = t.h / Math.max(1, t.rows), cellW = t.w / Math.max(1, t.cols);
+        t.rows = rows;
+        t.cols = cols;
+        t.cells = cells;
+        t.evaluate();
+        t.w = Math.min(Ink.W - t.x - 10, cellW * cols);
+        t.h = cellH * rows;
+        commitSnapshot(page, old);
+    }
+
+    /** Texto pegado del portapapeles, como cuadro de texto en la página que se ve. */
+    void pasteText(String text) {
+        Ink.Page page = visiblePage();
+        if (page == null || text.trim().isEmpty()) return;
+        int index = visible;
+        String old = page.toJson();
+        Ink.Item it = new Ink.Item(Ink.newId(), "text");
+        it.text = text;
+        it.size = 28;
+        it.color = penColor;
+        it.x = 60;
+        it.w = Ink.W - 120;
+        it.y = visibleCenterY(index, renderer.itemHeight(it));
+        page.items.add(it);
+        commitSnapshot(page, old);
+        ArrayList<Ink.Item> one = new ArrayList<>();
+        one.add(it);
+        selectInserted(index, new ArrayList<>(), one);
+    }
+
+    /** Vacía la página que se ve (se puede deshacer). */
+    void clearVisiblePage() {
+        Ink.Page page = visiblePage();
+        if (page == null || (page.strokes.isEmpty() && page.items.isEmpty())) return;
+        String old = page.toJson();
+        clearSelection();
+        page.strokes.clear();
+        page.items.clear();
+        commitSnapshot(page, old);
     }
 
     /** Crea o cambia un cuadro de texto (texto vacío: se borra). */
@@ -612,9 +731,29 @@ final class InkView extends View {
                 || (fingerDraws && t == MotionEvent.TOOL_TYPE_FINGER && fingers == 0);
     }
 
+    private static boolean button(MotionEvent e) {
+        return (e.getButtonState() & (MotionEvent.BUTTON_STYLUS_PRIMARY | MotionEvent.BUTTON_SECONDARY)) != 0;
+    }
+
     private boolean erases(MotionEvent e, int idx) {
-        return tool == ERASER || e.getToolType(idx) == MotionEvent.TOOL_TYPE_ERASER
-                || (e.getButtonState() & MotionEvent.BUTTON_STYLUS_PRIMARY) != 0;
+        return (tool == ERASER && eraseMode != ERASE_LASSO) || e.getToolType(idx) == MotionEvent.TOOL_TYPE_ERASER
+                || (button(e) && buttonHold == HOLD_ERASE);
+    }
+
+    private long lastButton;
+
+    /** Botón del S Pen sin tocar la pantalla (el lápiz en el aire). */
+    @Override
+    public boolean onGenericMotionEvent(MotionEvent e) {
+        if (e.getActionMasked() == MotionEvent.ACTION_BUTTON_PRESS && e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS
+                && (e.getActionButton() & (MotionEvent.BUTTON_STYLUS_PRIMARY | MotionEvent.BUTTON_SECONDARY)) != 0) {
+            long now = SystemClock.uptimeMillis();
+            boolean twice = now - lastButton < 400;
+            lastButton = twice ? 0 : now;
+            listener.onPenButton(twice);
+            return true;
+        }
+        return super.onGenericMotionEvent(e);
     }
 
     private float pressure(MotionEvent e, int idx, int h) {
@@ -692,8 +831,10 @@ final class InkView extends View {
             mode = ERASE;
             erased.clear();
             before.clear();
-        } else if (tool == LASSO) {
+        } else if (tool == LASSO || (tool == ERASER && eraseMode == ERASE_LASSO)
+                || (button(e) && buttonHold == HOLD_LASSO)) {
             mode = LASSO_DRAW;
+            lassoErases = tool == ERASER;
             lasso.clear();
         } else if (tool == TEXT) {
             mode = TEXT_TAP;
@@ -705,9 +846,10 @@ final class InkView extends View {
             laserEnds.add(0L);
         } else {
             mode = STROKE;
-            String kind = tool == HIGHLIGHTER ? Ink.HIGHLIGHTER : tool == TAPE ? Ink.TAPE : penKind;
-            int color = tool == HIGHLIGHTER ? highlighterColor : tool == TAPE ? PageRenderer.TAPE_COLOR : penColor;
-            float width = tool == HIGHLIGHTER ? highlighterWidth : tool == TAPE ? 34 : penWidth;
+            boolean hl = tool == HIGHLIGHTER || (button(e) && buttonHold == HOLD_HIGHLIGHTER);
+            String kind = hl ? Ink.HIGHLIGHTER : tool == TAPE ? Ink.TAPE : penKind;
+            int color = hl ? highlighterColor : tool == TAPE ? PageRenderer.TAPE_COLOR : penColor;
+            float width = hl ? highlighterWidth : tool == TAPE ? 34 : penWidth;
             current = new Ink.Stroke(Ink.newId(), kind, color, width);
             snapped = false;
             holdX = holdY = Float.NaN;
@@ -782,7 +924,11 @@ final class InkView extends View {
                 float x = docX, y = docY - pageTop(page);
                 Ink.Item hit = null;
                 for (Ink.Item it : pages.get(page).items) {
-                    if (!it.isImage() && x >= it.x && x <= it.x + it.w && y >= it.y && y <= it.y + renderer.textHeight(it) + 10) hit = it;
+                    if (!it.isImage() && x >= it.x && x <= it.x + it.w && y >= it.y && y <= it.y + renderer.itemHeight(it) + 10) hit = it;
+                }
+                if (hit != null && hit.isTable()) {
+                    listener.onTableRequest(page, hit);
+                    break;
                 }
                 listener.onTextRequest(page, hit, Math.max(20, Math.min(Ink.W - 220, x)), Math.max(20, Math.min(Ink.H - 60, y)));
                 break;
@@ -1006,13 +1152,16 @@ final class InkView extends View {
     // ---- Goma ----
 
     private void eraseAt(Ink.Page page, float x, float y) {
-        float r = partialEraser ? 8 : 10;
+        boolean partial = eraseMode == ERASE_PARTIAL && tool == ERASER;
+        float r = partial ? 8 : 10;
         boolean any = false;
         for (int i = page.strokes.size() - 1; i >= 0; i--) {
             Ink.Stroke s = page.strokes.get(i);
             if (!s.hits(x, y, r)) continue;
+            // Goma «sólo resaltador»: lo escrito con la pluma no se toca.
+            if (eraseMode == ERASE_HIGHLIGHTER && tool == ERASER && !Ink.HIGHLIGHTER.equals(s.tool)) continue;
             any = true;
-            if (partialEraser) {
+            if (partial) {
                 if (!before.containsKey(page)) before.put(page, page.toJson());
                 page.strokes.remove(i);
                 page.strokes.addAll(i, split(s, x, y, r + s.width / 2));
@@ -1093,7 +1242,7 @@ final class InkView extends View {
             if (in * 2 >= s.n) selStrokes.add(s);
         }
         for (Ink.Item it : page.items) {
-            float h = it.isImage() ? it.h : renderer.textHeight(it);
+            float h = renderer.itemHeight(it);
             if (inside(lasso, it.x + it.w / 2, it.y + h / 2)) selItems.add(it);
         }
         lasso.clear();
@@ -1103,6 +1252,11 @@ final class InkView extends View {
         }
         selPage = currentPage;
         updateSelBox();
+        if (lassoErases) {
+            // Goma de lazo: fuera lo rodeado, sin pasar por la selección.
+            deleteSelection();
+            return;
+        }
         listener.onSelection(true);
         invalidate();
     }
@@ -1114,7 +1268,7 @@ final class InkView extends View {
             r = Math.max(r, s.maxX + s.width); b = Math.max(b, s.maxY + s.width);
         }
         for (Ink.Item it : selItems) {
-            float h = it.isImage() ? it.h : renderer.textHeight(it);
+            float h = renderer.itemHeight(it);
             l = Math.min(l, it.x); t = Math.min(t, it.y);
             r = Math.max(r, it.x + it.w); b = Math.max(b, it.y + h);
         }

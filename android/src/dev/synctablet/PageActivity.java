@@ -56,7 +56,10 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
     private static final String[] PEN_NAMES = {"Pluma", "Lápiz", "Pincel", "Caligrafía"};
     private static final String[] BACKGROUNDS = {Ink.LINES, Ink.GRID, Ink.DOTS, Ink.CORNELL, Ink.TODO, Ink.MUSIC, Ink.PLAIN};
     private static final String[] BACKGROUND_NAMES = {"Rayas", "Cuadros", "Puntos", "Cornell (apuntes)", "Lista de tareas", "Pentagrama", "Lisa"};
-    private static final int PICK_IMAGE = 1, PICK_PDF = 2;
+    private static final int PICK_IMAGE = 1, PICK_PDF = 2, TAKE_PHOTO = 3, PICK_TEXT = 4;
+    /** Acciones para el botón del S Pen (clic y doble clic con el lápiz en el aire). */
+    private static final String[] PEN_ACTIONS = {"Cambiar entre pluma y goma", "Deshacer", "Lazo", "Puntero láser", "Resaltador", "Nada"};
+    private Uri photoUri;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable saver = this::save;
@@ -98,7 +101,8 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
         ink.highlighterWidth = prefs.getFloat("hlWidth", HL_WIDTHS[1]);
         ink.fingerDraws = prefs.getBoolean("finger", false);
         ink.autoShapes = prefs.getBoolean("shapes", false);
-        ink.partialEraser = prefs.getBoolean("partialEraser", false);
+        ink.eraseMode = prefs.getInt("eraseMode", InkView.ERASE_STROKES);
+        ink.buttonHold = prefs.getInt("buttonHold", InkView.HOLD_ERASE);
         customColor = prefs.getInt("customColor", 0xFF0EA5E9);
 
         FrameLayout root = new FrameLayout(this);
@@ -224,13 +228,7 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
             else setTool(InkView.ERASER);
         });
         lasso = icon(IconView.LASSO, "Lazo: seleccionar, mover y cambiar tamaño", v -> setTool(InkView.LASSO));
-        shapes = icon(IconView.SHAPES, "Convertir en figuras", v -> {
-            ink.autoShapes = !ink.autoShapes;
-            prefs.edit().putBoolean("shapes", ink.autoShapes).apply();
-            refreshTools();
-            Ui.toast(this, ink.autoShapes ? "Figuras: cada trazo que lo parezca se convierte"
-                    : "Figuras: mantén el lápiz quieto al final del trazo para convertirlo");
-        });
+        shapes = icon(IconView.SHAPES, "Figuras", v -> shapeGallery());
         text = icon(IconView.TEXT, "Texto: toca la hoja para escribir", v -> setTool(InkView.TEXT));
         tape = icon(IconView.TAPE, "Cinta: tapa algo; tócala con el dedo para destaparla", v -> setTool(InkView.TAPE));
         laser = icon(IconView.LASER, "Puntero láser (también en el PC)", v -> setTool(InkView.LASER));
@@ -249,7 +247,7 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
         row.addView(icon(IconView.PAGES, "Páginas: ordenar, duplicar, borrar", v -> pageManager()));
         row.addView(icon(IconView.PAGE, "Plantilla de la hoja", v -> chooseTemplate()));
         row.addView(icon(IconView.IMAGE, "Insertar foto o PDF", v -> insertMenu()));
-        row.addView(icon(IconView.EXPORT, "Exportar a PDF", v -> exportPdf()));
+        row.addView(icon(IconView.EXPORT, "Exportar", v -> exportMenu()));
         row.addView(sep(false));
         finger = icon(IconView.HAND, "Dibujar con el dedo", v -> {
             ink.fingerDraws = !ink.fingerDraws;
@@ -404,13 +402,168 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
     }
 
     private void chooseEraser() {
+        String[] modes = {"Trazos enteros", "Sólo lo que toca (parcial)", "Sólo el resaltador", "Lo que rodees (lazo)"};
         new AlertDialog.Builder(this)
                 .setTitle("Goma")
-                .setSingleChoiceItems(new String[] {"Borra trazos enteros", "Borra sólo lo que toca"}, ink.partialEraser ? 1 : 0, (d, which) -> {
-                    ink.partialEraser = which == 1;
-                    prefs.edit().putBoolean("partialEraser", ink.partialEraser).apply();
+                .setSingleChoiceItems(modes, ink.eraseMode, (d, which) -> {
+                    ink.eraseMode = which;
+                    prefs.edit().putInt("eraseMode", which).apply();
                     d.dismiss();
+                    Ui.toast(this, "Goma: " + modes[which].toLowerCase());
                 })
+                .setNeutralButton("Borrar toda esta página", (d, w) -> new AlertDialog.Builder(this)
+                        .setTitle("¿Vaciar la página " + (index + 1) + "?")
+                        .setMessage("Se puede deshacer.")
+                        .setPositiveButton("Vaciar", (d2, w2) -> ink.clearVisiblePage())
+                        .setNegativeButton("Cancelar", null)
+                        .show())
+                .show();
+    }
+
+    // ---- Figuras ----
+
+    /** Una figura de la galería dibujada en pequeño. */
+    private static final class ShapePreview extends View {
+        private final ShapeLibrary.Shape shape;
+        private final android.graphics.Paint paint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+
+        ShapePreview(android.content.Context c, ShapeLibrary.Shape s) {
+            super(c);
+            shape = s;
+            paint.setStyle(android.graphics.Paint.Style.STROKE);
+            paint.setStrokeCap(android.graphics.Paint.Cap.ROUND);
+            paint.setStrokeJoin(android.graphics.Paint.Join.ROUND);
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            float pad = getWidth() * 0.16f, box = getWidth() - 2 * pad;
+            float w = shape.aspect >= 1 ? box : box * shape.aspect, h = w / shape.aspect;
+            float x0 = (getWidth() - w) / 2, y0 = (getHeight() - h) / 2;
+            for (int pass = 0; pass < 2; pass++) {
+                paint.setColor(pass == 0 ? 0x66FFFFFF : 0xFFFFFFFF);
+                paint.setStrokeWidth(pass == 0 ? 1.5f : 3);
+                for (float[] l : pass == 0 ? shape.faint : shape.lines) {
+                    android.graphics.Path p = new android.graphics.Path();
+                    for (int i = 0; i + 1 < l.length; i += 2) {
+                        if (i == 0) p.moveTo(x0 + l[i] * w, y0 + l[i + 1] * h);
+                        else p.lineTo(x0 + l[i] * w, y0 + l[i + 1] * h);
+                    }
+                    c.drawPath(p, paint);
+                }
+            }
+        }
+    }
+
+    /** Galería: geométricas, cartesianas, 3D y ondas; y convertir trazos solos. */
+    private void shapeGallery() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = Ui.dp(this, 18);
+        box.setPadding(pad, pad / 2, pad, pad);
+        android.widget.CheckBox auto = new android.widget.CheckBox(this);
+        auto.setText("Convertir mis trazos en figuras al dibujarlos");
+        auto.setChecked(ink.autoShapes);
+        auto.setOnCheckedChangeListener((b, on) -> {
+            ink.autoShapes = on;
+            prefs.edit().putBoolean("shapes", on).apply();
+            refreshTools();
+        });
+        box.addView(auto);
+        box.addView(Ui.text(this, "Sin activarlo: deja el lápiz quieto al final de un trazo y se convierte. "
+                + "O toca una figura para insertarla (después la mueves y cambias de tamaño).", 13, 0xFF9AA9AE, false));
+        AlertDialog[] dialog = new AlertDialog[1];
+        int cell = Ui.dp(this, 86);
+        int cols = Math.max(4, (getResources().getDisplayMetrics().widthPixels * 7 / 10) / (cell + Ui.dp(this, 8)));
+        for (int g = 0; g < ShapeLibrary.GROUPS.length; g++) {
+            TextView head = Ui.text(this, ShapeLibrary.GROUPS[g], 16, 0xFFFFFFFF, true);
+            head.setPadding(0, Ui.dp(this, 16), 0, Ui.dp(this, 6));
+            box.addView(head);
+            GridLayout grid = new GridLayout(this);
+            grid.setColumnCount(cols);
+            for (ShapeLibrary.Shape s : ShapeLibrary.group(g)) {
+                LinearLayout item = new LinearLayout(this);
+                item.setOrientation(LinearLayout.VERTICAL);
+                item.setGravity(Gravity.CENTER_HORIZONTAL);
+                item.setBackground(Ui.round(0x1AFFFFFF, Ui.dp(this, 14)));
+                item.addView(new ShapePreview(this, s), new LinearLayout.LayoutParams(cell, cell));
+                TextView name = Ui.text(this, s.name, 11, 0xCCFFFFFF, false);
+                name.setGravity(Gravity.CENTER);
+                name.setMaxWidth(cell);
+                item.addView(name);
+                item.setPadding(0, 0, 0, Ui.dp(this, 6));
+                item.setContentDescription(s.name);
+                item.setOnClickListener(v -> {
+                    dialog[0].dismiss();
+                    if (ink.tool != InkView.LASSO) setTool(InkView.LASSO);
+                    ink.insertShape(s);
+                });
+                GridLayout.LayoutParams lp = new GridLayout.LayoutParams();
+                lp.setMargins(Ui.dp(this, 4), Ui.dp(this, 4), Ui.dp(this, 4), Ui.dp(this, 4));
+                grid.addView(item, lp);
+            }
+            box.addView(grid);
+        }
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(box);
+        dialog[0] = new AlertDialog.Builder(this).setTitle("Figuras").setView(scroll).setNegativeButton("Cerrar", null).show();
+    }
+
+    // ---- Botones del S Pen ----
+
+    @Override
+    public void onPenButton(boolean twice) {
+        int action = prefs.getInt(twice ? "penDouble" : "penClick", twice ? 1 : 0);
+        switch (action) {
+            case 0:
+                setTool(ink.tool == InkView.ERASER ? InkView.PEN : InkView.ERASER);
+                Ui.toast(this, ink.tool == InkView.ERASER ? "Goma" : "Pluma");
+                break;
+            case 1:
+                ink.undo();
+                break;
+            case 2:
+                setTool(InkView.LASSO);
+                break;
+            case 3:
+                setTool(ink.tool == InkView.LASER ? InkView.PEN : InkView.LASER);
+                break;
+            case 4:
+                setTool(ink.tool == InkView.HIGHLIGHTER ? InkView.PEN : InkView.HIGHLIGHTER);
+                break;
+            default:
+        }
+    }
+
+    private void penButtons() {
+        String[] hold = {"Borrar", "Lazo (seleccionar)", "Resaltador", "Nada"};
+        String[] rows = {
+            "Mantener el botón mientras escribes: " + hold[ink.buttonHold],
+            "Un clic con el lápiz en el aire: " + PEN_ACTIONS[prefs.getInt("penClick", 0)],
+            "Doble clic con el lápiz en el aire: " + PEN_ACTIONS[prefs.getInt("penDouble", 1)],
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("Botones del S Pen")
+                .setItems(rows, (d, which) -> {
+                    if (which == 0) {
+                        new AlertDialog.Builder(this).setTitle("Mantener el botón mientras escribes")
+                                .setSingleChoiceItems(hold, ink.buttonHold, (d2, k) -> {
+                                    ink.buttonHold = k;
+                                    prefs.edit().putInt("buttonHold", k).apply();
+                                    d2.dismiss();
+                                    penButtons();
+                                }).show();
+                    } else {
+                        String key = which == 1 ? "penClick" : "penDouble";
+                        new AlertDialog.Builder(this).setTitle(which == 1 ? "Un clic" : "Doble clic")
+                                .setSingleChoiceItems(PEN_ACTIONS, prefs.getInt(key, which == 1 ? 0 : 1), (d2, k) -> {
+                                    prefs.edit().putInt(key, k).apply();
+                                    d2.dismiss();
+                                    penButtons();
+                                }).show();
+                    }
+                })
+                .setNegativeButton("Cerrar", null)
                 .show();
     }
 
@@ -532,10 +685,12 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
     private void pageMenu() {
         new AlertDialog.Builder(this)
                 .setTitle("Página " + (index + 1) + " de " + notebook.pages.size())
-                .setItems(new String[] {"Página nueva al final", "Páginas (ordenar, duplicar, borrar)", "Plantilla", "Borrar esta página"}, (d, which) -> {
+                .setItems(new String[] {"Página nueva al final", "Páginas (ordenar, duplicar, borrar)", "Plantilla",
+                        "Botones del S Pen", "Borrar esta página"}, (d, which) -> {
                     if (which == 0) addPage();
                     else if (which == 1) pageManager();
                     else if (which == 2) chooseTemplate();
+                    else if (which == 3) penButtons();
                     else confirmDeletePage(index, null);
                 })
                 .show();
@@ -667,23 +822,187 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
     // ---- Fotos y PDF ----
 
     private void insertMenu() {
+        String[] options = {"Foto o imagen de la galería", "Hacer una foto con la cámara", "PDF (sus páginas al final del cuaderno)",
+            "Hoja de cálculo", "Archivo de texto o Markdown", "Pegar del portapapeles"};
         new AlertDialog.Builder(this)
                 .setTitle("Insertar")
-                .setItems(new String[] {"Foto o imagen", "PDF (sus páginas al final del cuaderno)"}, (d, which) -> {
-                    Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE);
-                    pick.setType(which == 0 ? "image/*" : "application/pdf");
-                    startActivityForResult(pick, which == 0 ? PICK_IMAGE : PICK_PDF);
+                .setItems(options, (d, which) -> {
+                    switch (which) {
+                        case 0: pick("image/*", PICK_IMAGE); break;
+                        case 1: takePhoto(); break;
+                        case 2: pick("application/pdf", PICK_PDF); break;
+                        case 3: askTableSize(); break;
+                        case 4: pick("text/*", PICK_TEXT); break;
+                        default: paste();
+                    }
                 })
+                .show();
+    }
+
+    private void pick(String type, int request) {
+        Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType(type);
+        startActivityForResult(pick, request);
+    }
+
+    /** La cámara guarda la foto en Imágenes/SyncTablet y después se inserta. */
+    private void takePhoto() {
+        ContentValues v = new ContentValues();
+        v.put(MediaStore.Images.Media.DISPLAY_NAME, "SyncTablet " + System.currentTimeMillis() + ".jpg");
+        v.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+        if (Build.VERSION.SDK_INT >= 29) v.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SyncTablet");
+        photoUri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
+        Intent cam = new Intent(MediaStore.ACTION_IMAGE_CAPTURE).putExtra(MediaStore.EXTRA_OUTPUT, photoUri);
+        try {
+            startActivityForResult(cam, TAKE_PHOTO);
+        } catch (RuntimeException e) {
+            Ui.toast(this, "No hay app de cámara");
+        }
+    }
+
+    private void askTableSize() {
+        String[] sizes = {"3 × 3", "4 × 3", "5 × 4", "8 × 4", "10 × 6"};
+        int[][] rc = {{3, 3}, {4, 3}, {5, 4}, {8, 4}, {10, 6}};
+        new AlertDialog.Builder(this)
+                .setTitle("Hoja de cálculo (filas × columnas)")
+                .setItems(sizes, (d, which) -> {
+                    if (ink.tool != InkView.LASSO) setTool(InkView.LASSO);
+                    ink.insertTable(rc[which][0], rc[which][1]);
+                    Ui.toast(this, "Con la herramienta de texto (T) tocas la tabla para escribir en ella");
+                })
+                .show();
+    }
+
+    /** Del portapapeles: una imagen se inserta como foto; el texto, como cuadro de texto. */
+    private void paste() {
+        android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        android.content.ClipData clip = cm.getPrimaryClip();
+        if (clip == null || clip.getItemCount() == 0) {
+            Ui.toast(this, "El portapapeles está vacío");
+            return;
+        }
+        android.content.ClipData.Item item = clip.getItemAt(0);
+        String type = clip.getDescription().getMimeTypeCount() > 0 ? clip.getDescription().getMimeType(0) : "";
+        if (item.getUri() != null && (type.startsWith("image/") || String.valueOf(getContentResolver().getType(item.getUri())).startsWith("image/"))) {
+            insertImage(item.getUri());
+            return;
+        }
+        CharSequence text = item.coerceToText(this);
+        if (text == null || text.toString().trim().isEmpty()) {
+            Ui.toast(this, "No hay texto ni imagen que pegar");
+            return;
+        }
+        if (ink.tool != InkView.LASSO) setTool(InkView.LASSO);
+        ink.pasteText(text.toString());
+    }
+
+    private void importText(Uri uri) {
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0 && out.size() < 20000) out.write(buf, 0, n);
+            String text = out.toString("UTF-8");
+            if (ink.tool != InkView.LASSO) setTool(InkView.LASSO);
+            ink.pasteText(text.length() > 20000 ? text.substring(0, 20000) : text);
+        } catch (IOException | RuntimeException e) {
+            Ui.toast(this, "No se pudo leer el archivo");
+        }
+    }
+
+    // ---- Hojas de cálculo ----
+
+    @Override
+    public void onTableRequest(int page, Ink.Item table) {
+        final int[] size = {table.rows, table.cols};
+        final String[][] cells = {table.cells.clone()};
+        ScrollView scroll = new ScrollView(this);
+        HorizontalScrollView hs = new HorizontalScrollView(this);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = Ui.dp(this, 14);
+        box.setPadding(pad, pad / 2, pad, 0);
+        GridLayout grid = new GridLayout(this);
+        ArrayList<EditText> fields = new ArrayList<>();
+        Runnable[] fill = new Runnable[1];
+        Runnable collect = () -> {
+            for (int i = 0; i < fields.size() && i < cells[0].length; i++) cells[0][i] = fields.get(i).getText().toString();
+        };
+        fill[0] = () -> {
+            grid.removeAllViews();
+            fields.clear();
+            grid.setColumnCount(size[1] + 1);
+            grid.addView(new View(this), new GridLayout.LayoutParams());
+            for (int c = 0; c < size[1]; c++) {
+                TextView h = Ui.text(this, String.valueOf((char) ('A' + c)), 13, 0xFF9AA9AE, true);
+                h.setGravity(Gravity.CENTER);
+                grid.addView(h);
+            }
+            for (int r = 0; r < size[0]; r++) {
+                grid.addView(Ui.text(this, String.valueOf(r + 1), 13, 0xFF9AA9AE, true));
+                for (int c = 0; c < size[1]; c++) {
+                    EditText e = new EditText(this);
+                    e.setSingleLine(true);
+                    e.setMinWidth(Ui.dp(this, 110));
+                    e.setTextSize(14);
+                    int i = r * size[1] + c;
+                    e.setText(i < cells[0].length && cells[0][i] != null ? cells[0][i] : "");
+                    fields.add(e);
+                    grid.addView(e);
+                }
+            }
+        };
+        fill[0].run();
+        LinearLayout actions = new LinearLayout(this);
+        String[] names = {"+ Fila", "− Fila", "+ Columna", "− Columna"};
+        for (int k = 0; k < names.length; k++) {
+            TextView b = Ui.button(this, names[k]);
+            b.setTextColor(0xFFEEF3F4);
+            final int a = k;
+            b.setOnClickListener(v -> {
+                collect.run();
+                int rows = size[0] + (a == 0 ? 1 : a == 1 ? -1 : 0), cols = size[1] + (a == 2 ? 1 : a == 3 ? -1 : 0);
+                if (rows < 1 || cols < 1 || rows > 60 || cols > 20) return;
+                String[] next = new String[rows * cols];
+                for (int r = 0; r < rows; r++) for (int c = 0; c < cols; c++) {
+                    next[r * cols + c] = r < size[0] && c < size[1] && r * size[1] + c < cells[0].length ? cells[0][r * size[1] + c] : "";
+                }
+                size[0] = rows;
+                size[1] = cols;
+                cells[0] = next;
+                fill[0].run();
+            });
+            actions.addView(b);
+        }
+        box.addView(actions);
+        box.addView(Ui.text(this, "Fórmulas: =A1+B2, =SUMA(A1:A5), =PROMEDIO(…), =MIN, =MAX, =CONTAR", 12, 0xFF9AA9AE, false));
+        box.addView(grid);
+        hs.addView(box);
+        scroll.addView(hs);
+        new AlertDialog.Builder(this)
+                .setTitle("Hoja de cálculo")
+                .setView(scroll)
+                .setPositiveButton("Guardar", (d, w) -> {
+                    collect.run();
+                    ink.putTable(page, table, cells[0], size[0], size[1]);
+                })
+                .setNegativeButton("Cancelar", null)
                 .show();
     }
 
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == TAKE_PHOTO) {
+            if (result == RESULT_OK && photoUri != null) insertImage(photoUri);
+            else if (photoUri != null) getContentResolver().delete(photoUri, null, null);
+            photoUri = null;
+            return;
+        }
         if (result != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         if (request == PICK_IMAGE) insertImage(uri);
         else if (request == PICK_PDF) importPdf(uri);
+        else if (request == PICK_TEXT) importText(uri);
     }
 
     private void insertImage(Uri uri) {
@@ -772,6 +1091,94 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
         }).start();
     }
 
+    private void exportMenu() {
+        new AlertDialog.Builder(this)
+                .setTitle("Exportar")
+                .setItems(new String[] {"Cuaderno entero en PDF", "Esta página como imagen (PNG)", "Los textos del cuaderno (Markdown)"}, (d, which) -> {
+                    if (which == 0) exportPdf();
+                    else if (which == 1) exportPng();
+                    else exportMarkdown();
+                })
+                .show();
+    }
+
+    /** La página que se ve, a 2000 px de ancho, en Imágenes/SyncTablet; y compartirla. */
+    private void exportPng() {
+        save();
+        Ink.Page p = ink.visiblePage();
+        if (p == null) return;
+        int page = index + 1;
+        new Thread(() -> {
+            int w = 2000, h = Math.round(w * Ink.H / Ink.W);
+            Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            Canvas c = new Canvas(b);
+            c.scale(w / Ink.W, w / Ink.W);
+            new PageRenderer(this).drawPage(c, p, w / Ink.W, null, null);
+            String name = notebook.title.replaceAll("[\\\\/:*?\"<>|]", " ").trim() + " - página " + page + ".png";
+            ContentValues v = new ContentValues();
+            v.put(MediaStore.Images.Media.DISPLAY_NAME, name);
+            v.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+            if (Build.VERSION.SDK_INT >= 29) v.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SyncTablet");
+            Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
+            try (OutputStream out = uri == null ? null : getContentResolver().openOutputStream(uri)) {
+                if (out == null) throw new IOException("sin acceso a Imágenes");
+                b.compress(Bitmap.CompressFormat.PNG, 100, out);
+            } catch (IOException | RuntimeException e) {
+                main.post(() -> Ui.toast(this, "No se pudo guardar la imagen"));
+                return;
+            }
+            main.post(() -> {
+                Ui.toast(this, "Guardada en Imágenes/SyncTablet");
+                share(uri, "image/png");
+            });
+        }).start();
+    }
+
+    /** Todos los cuadros de texto (y hojas de cálculo) del cuaderno, como Markdown. */
+    private void exportMarkdown() {
+        save();
+        StringBuilder md = new StringBuilder("# ").append(notebook.title).append("\n");
+        for (int i = 0; i < notebook.pages.size(); i++) {
+            Ink.Page p = store.page(notebook.pages.get(i));
+            if (p == null || p.items.isEmpty()) continue;
+            StringBuilder page = new StringBuilder();
+            for (Ink.Item it : p.items) {
+                if (it.isTable()) {
+                    for (int r = 0; r < it.rows; r++) {
+                        page.append('|');
+                        for (int c = 0; c < it.cols; c++) {
+                            int k = r * it.cols + c;
+                            page.append(' ').append(k < it.values.length ? it.values[k].replace("|", "\\|") : "").append(" |");
+                        }
+                        page.append('\n');
+                        if (r == 0) {
+                            page.append('|');
+                            for (int c = 0; c < it.cols; c++) page.append(" --- |");
+                            page.append('\n');
+                        }
+                    }
+                    page.append('\n');
+                } else if (!it.isImage() && it.text != null && !it.text.trim().isEmpty()) {
+                    page.append(it.text.trim()).append("\n\n");
+                }
+            }
+            if (page.length() > 0) md.append("\n## Página ").append(i + 1).append("\n\n").append(page);
+        }
+        if (md.indexOf("## ") < 0) {
+            Ui.toast(this, "Este cuaderno aún no tiene textos ni tablas");
+            return;
+        }
+        Intent send = new Intent(Intent.ACTION_SEND).setType("text/markdown")
+                .putExtra(Intent.EXTRA_SUBJECT, notebook.title).putExtra(Intent.EXTRA_TEXT, md.toString());
+        startActivity(Intent.createChooser(send, "Compartir los textos"));
+    }
+
+    private void share(Uri uri, String type) {
+        Intent share = new Intent(Intent.ACTION_SEND).setType(type)
+                .putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        startActivity(Intent.createChooser(share, "Compartir"));
+    }
+
     /** El cuaderno entero a PDF en Descargas/SyncTablet, y compartirlo. */
     private void exportPdf() {
         save();
@@ -810,9 +1217,7 @@ public final class PageActivity extends Activity implements InkView.Listener, Sy
             final Uri done = uri;
             main.post(() -> {
                 Ui.toast(this, "Guardado en Descargas/SyncTablet/" + name);
-                Intent share = new Intent(Intent.ACTION_SEND).setType("application/pdf")
-                        .putExtra(Intent.EXTRA_STREAM, done).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                startActivity(Intent.createChooser(share, "Compartir el PDF"));
+                share(done, "application/pdf");
             });
         }).start();
     }

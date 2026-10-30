@@ -156,6 +156,22 @@ function drawItem(it) {
     const img = image(it.asset);
     if (img) ctx.drawImage(img, it.x, it.y, it.w, it.h);
     else { ctx.fillStyle = '#EEF2F7'; ctx.fillRect(it.x, it.y, it.w, it.h); }
+  } else if (it.kind === 'table') {
+    const rows = Math.max(1, it.rows), cols = Math.max(1, it.cols), cw = it.w / cols, ch = it.h / rows;
+    ctx.fillStyle = '#F1F5F9'; ctx.fillRect(it.x, it.y, it.w, ch);
+    ctx.strokeStyle = '#94A3B8'; ctx.lineWidth = 1.2; ctx.beginPath();
+    for (let r = 0; r <= rows; r++) { ctx.moveTo(it.x, it.y + r * ch); ctx.lineTo(it.x + it.w, it.y + r * ch); }
+    for (let c = 0; c <= cols; c++) { ctx.moveTo(it.x + c * cw, it.y); ctx.lineTo(it.x + c * cw, it.y + it.h); }
+    ctx.stroke();
+    const size = Math.min(32, Math.max(10, ch * 0.5));
+    ctx.fillStyle = '#111827';
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+      const v = (it.values || [])[r * cols + c];
+      if (!v) continue;
+      ctx.font = `${r === 0 ? 'bold ' : ''}${size}px sans-serif`;
+      ctx.save(); ctx.beginPath(); ctx.rect(it.x + c * cw, it.y + r * ch, cw, ch); ctx.clip();
+      ctx.fillText(v, it.x + c * cw + 6, it.y + r * ch + ch * 0.68); ctx.restore();
+    }
   } else if (it.kind === 'text') {
     ctx.fillStyle = it.color || '#111827'; ctx.font = `${it.size || 28}px sans-serif`; ctx.textBaseline = 'alphabetic';
     wrapText(it.text, it.w, it.size || 28).forEach((l, i) => ctx.fillText(l, it.x, it.y + (it.size || 28) * (1 + 1.3 * i)));

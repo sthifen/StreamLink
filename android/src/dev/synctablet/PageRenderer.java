@@ -123,7 +123,46 @@ final class PageRenderer {
         }
     }
 
+    /** Alto de un elemento (para seleccionarlo). */
+    float itemHeight(Ink.Item it) {
+        return it.isImage() || it.isTable() ? it.h : textHeight(it);
+    }
+
+    private final Paint grid = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint header = new Paint();
+
+    /** Hoja de cálculo: rejilla, primera fila resaltada y los valores calculados. */
+    private void drawTable(Canvas c, Ink.Item it) {
+        int rows = Math.max(1, it.rows), cols = Math.max(1, it.cols);
+        float cw = it.w / cols, ch = it.h / rows;
+        header.setColor(0xFFF1F5F9);
+        c.drawRect(it.x, it.y, it.x + it.w, it.y + ch, header);
+        grid.setStyle(Paint.Style.STROKE);
+        grid.setColor(0xFF94A3B8);
+        grid.setStrokeWidth(1.2f);
+        for (int r = 0; r <= rows; r++) c.drawLine(it.x, it.y + r * ch, it.x + it.w, it.y + r * ch, grid);
+        for (int k = 0; k <= cols; k++) c.drawLine(it.x + k * cw, it.y, it.x + k * cw, it.y + it.h, grid);
+        text.setColor(0xFF111827);
+        text.setTextSize(Math.min(32, Math.max(10, ch * 0.5f)));
+        for (int r = 0; r < rows; r++) {
+            text.setFakeBoldText(r == 0);
+            for (int k = 0; k < cols; k++) {
+                int i = r * cols + k;
+                if (i >= it.values.length || it.values[i] == null || it.values[i].isEmpty()) continue;
+                c.save();
+                c.clipRect(it.x + k * cw, it.y + r * ch, it.x + (k + 1) * cw, it.y + (r + 1) * ch);
+                c.drawText(it.values[i], it.x + k * cw + 6, it.y + r * ch + ch * 0.68f, text);
+                c.restore();
+            }
+        }
+        text.setFakeBoldText(false);
+    }
+
     void drawItem(Canvas c, Ink.Item it) {
+        if (it.isTable()) {
+            drawTable(c, it);
+            return;
+        }
         if (it.isImage()) {
             Bitmap b = asset(it.asset);
             RectF r = new RectF(it.x, it.y, it.x + it.w, it.y + it.h);

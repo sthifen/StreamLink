@@ -76,6 +76,9 @@ final class Ink {
         String asset, text;
         float x, y, w, h, size = 28;
         int color = 0xFF111827;
+        /** Hoja de cálculo: lo escrito y lo calculado, por filas. */
+        int rows, cols;
+        String[] cells = new String[0], values = new String[0];
 
         Item(String id, String kind) {
             this.id = id;
@@ -84,9 +87,19 @@ final class Ink {
 
         boolean isImage() { return "image".equals(kind); }
 
+        boolean isTable() { return "table".equals(kind); }
+
+        /** Recalcula las fórmulas. */
+        void evaluate() {
+            if (cells.length != rows * cols) cells = java.util.Arrays.copyOf(cells, rows * cols);
+            for (int i = 0; i < cells.length; i++) if (cells[i] == null) cells[i] = "";
+            values = Sheet.evaluate(cells, rows, cols);
+        }
+
         Item copy(String newId) {
             Item c = new Item(newId, kind);
             c.asset = asset; c.text = text; c.x = x; c.y = y; c.w = w; c.h = h; c.size = size; c.color = color;
+            c.rows = rows; c.cols = cols; c.cells = cells.clone(); c.values = values.clone();
             return c;
         }
 
@@ -100,6 +113,12 @@ final class Ink {
             if (isImage()) {
                 o.put("asset", asset);
                 o.put("h", h);
+            } else if (isTable()) {
+                o.put("h", h);
+                o.put("rows", rows);
+                o.put("cols", cols);
+                o.put("cells", new JSONArray(java.util.Arrays.asList(cells)));
+                o.put("values", new JSONArray(java.util.Arrays.asList(values)));
             } else {
                 o.put("text", text == null ? "" : text);
                 o.put("size", size);
@@ -116,6 +135,17 @@ final class Ink {
             i.w = (float) o.optDouble("w", 300); i.h = (float) o.optDouble("h", 200);
             i.size = (float) o.optDouble("size", 28);
             i.color = parseColor(o.optString("color", "#111827"), 0xFF111827);
+            i.rows = o.optInt("rows");
+            i.cols = o.optInt("cols");
+            JSONArray c = o.optJSONArray("cells"), v = o.optJSONArray("values");
+            if (c != null) {
+                i.cells = new String[c.length()];
+                for (int k = 0; k < c.length(); k++) i.cells[k] = c.optString(k);
+            }
+            if (v != null) {
+                i.values = new String[v.length()];
+                for (int k = 0; k < v.length(); k++) i.values[k] = v.optString(k);
+            }
             return i;
         }
     }
